@@ -1,6 +1,10 @@
-# R2Box
+<p align="center">
+  <img src="img/logo.png" alt="R2Box Logo" width="120" />
+</p>
 
-基于 Cloudflare R2 的轻量级临时文件分享网盘，支持前端直传、大文件分片上传、自动过期清理。
+<h1 align="center">R2Box</h1>
+
+<p align="center">基于 Cloudflare R2 的轻量级临时文件分享网盘，支持前端直传、大文件分片上传、自动过期清理。</p>
 
 ## 特性
 
@@ -47,13 +51,38 @@
 
 ### 2. 部署应用
 
-**方式一：使用 Git（推荐）**
+**方式一：使用预构建镜像（推荐）**
+
+```bash
+# 创建数据目录
+mkdir -p r2box/data && cd r2box
+
+# 下载 docker-compose.yml
+curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml
+
+# 修改 ACCESS_TOKEN 后启动
+docker compose up -d
+```
+
+或者使用 Docker 命令直接运行：
+
+```bash
+docker run -d \
+  --name r2box \
+  --restart unless-stopped \
+  -p 9988:9988 \
+  -v ./data:/app/data \
+  -e ACCESS_TOKEN=your_secure_password \
+  ghcr.io/today-ddr/r2box:latest
+```
+
+**方式二：从源码构建**
 
 ```bash
 git clone https://github.com/Today-ddr/r2box.git && cd r2box && docker compose up -d --build
 ```
 
-**方式二：手动下载**
+**方式三：手动下载**
 
 1. 下载项目：[点击下载 ZIP](https://github.com/Today-ddr/r2box/archive/refs/heads/main.zip)
 2. 解压后进入目录，运行：
@@ -87,17 +116,17 @@ environment:
 # 启动
 docker compose up -d
 
-# 重新构建并启动
-docker compose up -d --build
-
 # 查看日志
 docker compose logs -f
 
 # 停止
 docker compose down
 
-# 更新
-git pull && docker compose up -d --build
+# 更新到最新版本
+docker compose pull && docker compose up -d
+
+# 从源码重新构建（需先修改 docker-compose.yml 启用 build）
+docker compose up -d --build
 ```
 
 ## 技术栈

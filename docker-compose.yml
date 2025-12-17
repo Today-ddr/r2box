@@ -2,7 +2,8 @@ version: '3.8'
 
 services:
   r2box:
-    build: .
+    image: ghcr.io/today-ddr/r2box:latest
+    # build: .  # 如需本地构建，取消此行注释并注释上面的 image
     container_name: r2box
     restart: unless-stopped
     ports:

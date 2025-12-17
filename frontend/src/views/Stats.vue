@@ -4,7 +4,7 @@
       <n-layout-header class="header">
         <div class="header-left">
           <div class="logo">
-            <span class="logo-icon">📦</span>
+            <img src="/logo.png" alt="R2Box" class="logo-icon" />
             <span class="logo-text">R2Box</span>
           </div>
         </div>
@@ -166,7 +166,9 @@ onMounted(() => {
 }
 
 .logo-icon {
-  font-size: 28px;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
 }
 
 .logo-text {
