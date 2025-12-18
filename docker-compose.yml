@@ -3,7 +3,6 @@ version: '3.8'
 services:
   r2box:
     image: ghcr.io/today-ddr/r2box:latest
-    # build: .  # 如需本地构建，取消此行注释并注释上面的 image
     container_name: r2box
     restart: unless-stopped
     ports:
@@ -11,9 +10,6 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      # 必需配置：访问口令（请修改为你自己的密码）
-      - ACCESS_TOKEN=your_secure_password_here
-
       # 服务器端口
       - PORT=9988
 

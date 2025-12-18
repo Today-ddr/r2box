@@ -272,3 +272,4 @@ func (s *R2Service) TestConnection() error {
 	log.Println("[R2] 连接测试成功")
 	return nil
 }
+

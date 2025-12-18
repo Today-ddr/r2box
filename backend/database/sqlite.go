@@ -126,3 +126,19 @@ func IsR2Configured() (bool, error) {
 	}
 	return configured == "true", nil
 }
+
+// IsPasswordSet 检查密码是否已设置
+func IsPasswordSet() bool {
+	pwd, _ := GetConfig("password_hash")
+	return pwd != ""
+}
+
+// GetPasswordHash 获取密码哈希
+func GetPasswordHash() (string, error) {
+	return GetConfig("password_hash")
+}
+
+// SetPasswordHash 设置密码哈希
+func SetPasswordHash(hash string) error {
+	return SetConfig("password_hash", hash)
+}

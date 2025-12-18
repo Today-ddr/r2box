@@ -95,11 +95,6 @@ func main() {
 	// 加载配置
 	cfg := config.Load()
 
-	// 验证必需的配置
-	if cfg.AccessToken == "" {
-		log.Fatal("[App] 错误: ACCESS_TOKEN 环境变量未设置")
-	}
-
 	// 初始化数据库
 	if err := database.Init(cfg.DatabasePath); err != nil {
 		log.Fatalf("[App] 数据库初始化失败: %v", err)
@@ -129,12 +124,22 @@ func main() {
 	mux := http.NewServeMux()
 
 	// 创建认证处理器
-	authHandler := handlers.NewAuthHandler(cfg.AccessToken, database.DB)
+	authHandler := handlers.NewAuthHandler(database.DB)
 
 	// 公开路由（无需认证）
 	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/auth/login")
 		authHandler.Login(w, r)
+	})
+
+	mux.HandleFunc("/api/auth/setup-password", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] POST /api/auth/setup-password")
+		authHandler.SetupPassword(w, r)
+	})
+
+	mux.HandleFunc("/api/auth/password-status", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] GET /api/auth/password-status")
+		authHandler.CheckPasswordStatus(w, r)
 	})
 
 	// R2 配置向导（带配置变更回调）
@@ -143,29 +148,29 @@ func main() {
 	})
 
 	// 认证状态
-	mux.Handle("/api/auth/status", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/auth/status", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] GET /api/auth/status")
 		authHandler.Status(w, r)
 	})))
 
 	// R2 配置向导路由
-	mux.Handle("/api/setup/status", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/setup/status", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] GET /api/setup/status")
 		setupHandler.Status(w, r)
 	})))
 
-	mux.Handle("/api/setup/config", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/setup/config", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/setup/config")
 		setupHandler.SaveConfig(w, r)
 	})))
 
-	mux.Handle("/api/setup/test", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/setup/test", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/setup/test")
 		setupHandler.TestConnection(w, r)
 	})))
 
 	// 上传路由（动态获取 R2 服务）
-	mux.Handle("/api/upload/presign", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload/presign", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/upload/presign")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -177,7 +182,7 @@ func main() {
 		uploadHandler.GeneratePresignURL(w, r)
 	})))
 
-	mux.Handle("/api/upload/multipart/init", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload/multipart/init", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/upload/multipart/init")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -188,7 +193,7 @@ func main() {
 		uploadHandler.InitiateMultipartUpload(w, r)
 	})))
 
-	mux.Handle("/api/upload/multipart/presign", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload/multipart/presign", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/upload/multipart/presign")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -199,7 +204,7 @@ func main() {
 		uploadHandler.GenerateMultipartPresignURL(w, r)
 	})))
 
-	mux.Handle("/api/upload/multipart/complete", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload/multipart/complete", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/upload/multipart/complete")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -211,7 +216,7 @@ func main() {
 	})))
 
 	// 确认上传完成（小文件）
-	mux.Handle("/api/upload/confirm", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload/confirm", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] POST /api/upload/confirm")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -223,7 +228,7 @@ func main() {
 	})))
 
 	// 文件列表路由
-	mux.Handle("/api/files", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/files", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] GET /api/files")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
@@ -263,7 +268,7 @@ func main() {
 
 		if r.Method == http.MethodDelete {
 			// 删除需要认证
-			middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				filesHandler.Delete(w, r)
 			})).ServeHTTP(w, r)
 		} else {
@@ -273,7 +278,7 @@ func main() {
 	})
 
 	// 存储统计路由
-	mux.Handle("/api/stats", middleware.AuthMiddleware(cfg.AccessToken)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/stats", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] GET /api/stats")
 		statsHandler := handlers.NewStatsHandler(database.DB, cfg.TotalStorage)
 		statsHandler.GetStats(w, r)
@@ -330,9 +335,11 @@ func main() {
 	app.StartCleanupTask()
 	log.Println("[App] 过期文件清理任务已启动")
 
+	passwordSet := database.IsPasswordSet()
 	log.Printf("[App] ========================================")
 	log.Printf("[App] R2Box 服务器启动成功")
 	log.Printf("[App] 地址: http://localhost%s", addr)
+	log.Printf("[App] 密码状态: %v", passwordSet)
 	log.Printf("[App] R2 配置状态: %v", r2Configured)
 	log.Printf("[App] ========================================")
 

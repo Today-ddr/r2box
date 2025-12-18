@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  r2box:
+    build: .
+    container_name: r2box-dev
+    restart: unless-stopped
+    ports:
+      - "9988:9988"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=9988
+      - MAX_FILE_SIZE=5368709120
+      - TOTAL_STORAGE=10737418240
+      - DATABASE_PATH=/app/data/r2box.db

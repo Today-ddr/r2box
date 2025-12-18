@@ -9,20 +9,30 @@ export const useAuthStore = defineStore('auth', {
   }),
 
   actions: {
-    async login(token) {
+    async login(password) {
       try {
-        const response = await api.login(token)
+        const response = await api.login(password)
         if (response.success) {
           this.isAuthenticated = true
           this.needSetup = response.need_setup
-          this.token = token
-          localStorage.setItem('auth_token', token)
+          // Cookie 已由后端设置，这里存储用于 API 请求
+          const hash = await this.hashPassword(password)
+          this.token = hash
+          localStorage.setItem('auth_token', hash)
           return { success: true, needSetup: response.need_setup }
         }
         return { success: false, message: response.message }
       } catch (error) {
-        return { success: false, message: error.response?.data?.error || '登录失败' }
+        return { success: false, message: error.response?.data?.message || error.response?.data?.error || '登录失败' }
       }
+    },
+
+    async hashPassword(password) {
+      const encoder = new TextEncoder()
+      const data = encoder.encode(password)
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+      const hashArray = Array.from(new Uint8Array(hashBuffer))
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
     },
 
     async checkAuth() {

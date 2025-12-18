@@ -9,9 +9,9 @@ import (
 
 const (
 	RateLimitWindow   = 1 * time.Minute
-	RateLimitMax      = 60
-	MaxFailedAttempts = 5
-	BlockDuration     = 15 * time.Minute
+	RateLimitMax      = 300
+	MaxFailedAttempts = 10
+	BlockDuration     = 5 * time.Minute
 )
 
 // RateLimitMiddleware 速率限制中间件

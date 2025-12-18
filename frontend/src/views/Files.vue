@@ -9,8 +9,18 @@
           </div>
         </div>
         <n-space align="center" :size="16">
-          <n-button quaternary @click="router.push('/')">📤 上传文件</n-button>
-          <n-button quaternary @click="router.push('/stats')">📊 存储统计</n-button>
+          <n-button quaternary @click="router.push('/')">
+            <template #icon>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+            </template>
+            上传文件
+          </n-button>
+          <n-button quaternary @click="router.push('/stats')">
+            <template #icon>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z"/></svg>
+            </template>
+            存储统计
+          </n-button>
           <n-button quaternary type="error" @click="handleLogout">退出</n-button>
         </n-space>
       </n-layout-header>
@@ -36,6 +46,43 @@
         </n-card>
       </n-layout-content>
     </n-layout>
+
+    <!-- 文件信息弹窗 -->
+    <n-modal v-model:show="showInfoModal" preset="card" title="文件信息" style="width: 500px; border-radius: 16px;">
+      <template v-if="selectedFile">
+        <n-descriptions bordered :column="1">
+          <n-descriptions-item label="文件名">{{ selectedFile.filename }}</n-descriptions-item>
+          <n-descriptions-item label="文件大小">{{ formatBytes(selectedFile.size) }}</n-descriptions-item>
+          <n-descriptions-item label="上传时间">{{ new Date(selectedFile.created_at).toLocaleString('zh-CN') }}</n-descriptions-item>
+          <n-descriptions-item label="剩余时间">{{ selectedFile.remaining_time }}</n-descriptions-item>
+        </n-descriptions>
+
+        <n-divider />
+
+        <div class="link-group">
+          <n-text depth="3" style="font-size: 12px;">短链接</n-text>
+          <n-input-group>
+            <n-input :value="getShortUrl(selectedFile)" readonly />
+            <n-button type="primary" @click="copyUrl(getShortUrl(selectedFile), '短链接')">复制</n-button>
+          </n-input-group>
+        </div>
+
+        <div class="link-group" style="margin-top: 12px;">
+          <n-text depth="3" style="font-size: 12px;">直链</n-text>
+          <n-input-group>
+            <n-input :value="getDownloadUrl(selectedFile)" readonly />
+            <n-button type="primary" @click="copyUrl(getDownloadUrl(selectedFile), '直链')">复制</n-button>
+          </n-input-group>
+        </div>
+      </template>
+
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showInfoModal = false">关闭</n-button>
+          <n-button type="primary" @click="handleDownload(selectedFile)">下载文件</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </div>
 </template>
 
@@ -56,6 +103,12 @@ import {
   NIcon,
   NDataTable,
   NPopconfirm,
+  NModal,
+  NDescriptions,
+  NDescriptionsItem,
+  NDivider,
+  NInput,
+  NInputGroup,
   useMessage
 } from 'naive-ui'
 
@@ -63,6 +116,9 @@ const router = useRouter()
 const authStore = useAuthStore()
 const filesStore = useFilesStore()
 const message = useMessage()
+
+const showInfoModal = ref(false)
+const selectedFile = ref(null)
 
 const pagination = ref({
   page: 1,
@@ -129,7 +185,7 @@ const columns = [
   {
     title: '操作',
     key: 'actions',
-    width: 180,
+    width: 140,
     render: (row) => {
       const isDeleted = row.upload_status === 'deleted'
       return h('div', { style: 'display: flex; gap: 8px;' }, [
@@ -137,11 +193,11 @@ const columns = [
           NButton,
           {
             size: 'small',
-            type: 'primary',
+            type: 'info',
             disabled: isDeleted,
-            onClick: () => handleDownload(row)
+            onClick: () => showFileInfo(row)
           },
-          { default: () => '下载' }
+          { default: () => '详情' }
         ),
         h(
           NPopconfirm,
@@ -176,6 +232,24 @@ const formatBytes = (bytes) => {
   return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i]
 }
 
+const getShortUrl = (file) => {
+  return window.location.origin + '/s/' + file.short_code
+}
+
+const getDownloadUrl = (file) => {
+  return file.download_url || (window.location.origin + `/api/files/${file.id}/download`)
+}
+
+const copyUrl = (url, type) => {
+  navigator.clipboard.writeText(url)
+  message.success(`${type}已复制到剪贴板`)
+}
+
+const showFileInfo = (row) => {
+  selectedFile.value = row
+  showInfoModal.value = true
+}
+
 const loadFiles = async () => {
   try {
     await filesStore.fetchFiles(pagination.value.page)
@@ -186,8 +260,7 @@ const loadFiles = async () => {
 }
 
 const handleDownload = (row) => {
-  // 优先使用后端返回的 R2 直链
-  const downloadUrl = row.download_url || (window.location.origin + `/api/files/${row.id}/download`)
+  const downloadUrl = getDownloadUrl(row)
   window.open(downloadUrl, '_blank')
 }
 
@@ -253,5 +326,9 @@ onMounted(() => {
   padding: 32px;
   max-width: 1200px;
   margin: 0 auto;
+}
+
+.link-group {
+  margin-bottom: 4px;
 }
 </style>

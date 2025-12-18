@@ -22,7 +22,9 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   response => response.data,
   error => {
-    if (error.response?.status === 401) {
+    // 登录相关接口不自动跳转
+    const isAuthApi = error.config?.url?.includes('/auth/')
+    if (error.response?.status === 401 && !isAuthApi) {
       localStorage.removeItem('auth_token')
       window.location.href = '/login'
     }
@@ -32,12 +34,20 @@ api.interceptors.response.use(
 
 export default {
   // 认证
-  login(token) {
-    return api.post('/auth/login', { token })
+  login(password) {
+    return api.post('/auth/login', { password })
   },
 
   getAuthStatus() {
     return api.get('/auth/status')
+  },
+
+  getPasswordStatus() {
+    return api.get('/auth/password-status')
+  },
+
+  setupPassword(password) {
+    return api.post('/auth/setup-password', { password })
   },
 
   // R2 配置

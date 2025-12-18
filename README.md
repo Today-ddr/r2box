@@ -4,7 +4,23 @@
 
 <h1 align="center">R2Box</h1>
 
-<p align="center">基于 Cloudflare R2 的轻量级临时文件分享网盘，支持前端直传、大文件分片上传、自动过期清理。</p>
+<p align="center">
+  基于 Cloudflare R2 的轻量级临时文件分享网盘
+</p>
+
+<p align="center">
+  <a href="#特性">特性</a> •
+  <a href="#快速开始">快速开始</a> •
+  <a href="#部署指南">部署指南</a> •
+  <a href="#环境变量">环境变量</a> •
+  <a href="#常见问题">FAQ</a>
+</p>
+
+---
+
+## 简介
+
+R2Box 是一个基于 Cloudflare R2 对象存储的轻量级临时文件分享服务。支持前端直传、大文件分片上传、自动过期清理，适合个人或小团队使用。
 
 ## 特性
 
@@ -12,7 +28,7 @@
 - **大文件支持** - 支持最大 5GB 文件，自动分片上传
 - **自动过期** - 支持 1天/3天/7天/30天 自动删除
 - **R2 直链** - 上传完成后直接返回 R2 预签名下载链接
-- **Token 鉴权** - 基于口令的访问控制
+- **密码鉴权** - 首次访问设置密码，无需环境变量配置
 - **速率限制** - 防暴力破解，IP 限流保护
 - **存储监控** - 实时查看存储空间使用情况
 - **轻量部署** - 内存占用仅 ~55MB，适合低配服务器
@@ -20,21 +36,13 @@
 
 ## 界面展示
 
-### 首页概览
+| 首页 | 上传 |
+|:---:|:---:|
+| ![首页](img/homepage.png) | ![上传](img/upload_interface.png) |
 
-![首页](img/homepage.png)
-
-### 文件上传
-
-![上传界面](img/upload_interface.png)
-
-### 文件管理
-
-![文件列表](img/file_list.png)
-
-### 存储统计
-
-![存储统计](img/storage_usage.png)
+| 文件列表 | 存储统计 |
+|:---:|:---:|
+| ![文件列表](img/file_list.png) | ![存储统计](img/storage_usage.png) |
 
 ## 快速开始
 
@@ -49,22 +57,48 @@
    - Secret Access Key
    - Bucket Name
 
-### 2. 部署应用
-
-**方式一：使用预构建镜像（推荐）**
+### 2. 一键部署
 
 ```bash
-# 创建数据目录
 mkdir -p r2box/data && cd r2box
-
-# 下载 docker-compose.yml
 curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml
-
-# 修改 ACCESS_TOKEN 后启动
 docker compose up -d
 ```
 
-或者使用 Docker 命令直接运行：
+### 3. 首次配置
+
+1. 访问 `http://your-server-ip:9988`
+2. **首次访问会提示设置密码**（密码存储在数据库中）
+3. 登录后在 R2 配置向导中填写 R2 信息
+4. 测试连接 → 保存配置 → 开始使用！
+
+---
+
+## 部署指南
+
+### 生产环境部署 (Production)
+
+使用 GitHub Container Registry 预构建镜像，推荐用于生产环境。
+
+**配置文件：** `docker-compose.yml`
+
+**镜像源：** `ghcr.io/today-ddr/r2box:latest`
+
+```bash
+# 下载配置文件
+curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml
+
+# 启动服务
+docker compose up -d
+
+# 查看日志
+docker compose logs -f
+
+# 更新到最新版本
+docker compose pull && docker compose up -d
+```
+
+或使用 Docker 命令直接运行：
 
 ```bash
 docker run -d \
@@ -72,62 +106,70 @@ docker run -d \
   --restart unless-stopped \
   -p 9988:9988 \
   -v ./data:/app/data \
-  -e ACCESS_TOKEN=your_secure_password \
   ghcr.io/today-ddr/r2box:latest
 ```
 
-**方式二：从源码构建**
+### 本地开发部署 (Development)
+
+从源码构建，适用于开发调试和功能测试。
+
+**配置文件：** `docker-compose.dev.yml`
 
 ```bash
-git clone https://github.com/Today-ddr/r2box.git && cd r2box && docker compose up -d --build
+# 克隆项目
+git clone https://github.com/Today-ddr/r2box.git
+cd r2box
+
+# 构建并启动（从源码构建）
+docker compose -f docker-compose.dev.yml build --no-cache && docker compose -f docker-compose.dev.yml up
+
+# 后台运行
+docker compose -f docker-compose.dev.yml up -d
+
+# 停止服务
+docker compose -f docker-compose.dev.yml down
 ```
 
-**方式三：手动下载**
+---
 
-1. 下载项目：[点击下载 ZIP](https://github.com/Today-ddr/r2box/archive/refs/heads/main.zip)
-2. 解压后进入目录，运行：
+## 环境变量
 
-```bash
-docker compose up -d --build
-```
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `PORT` | `9988` | 服务端口 |
+| `MAX_FILE_SIZE` | `5368709120` | 单文件大小限制（字节），默认 5GB |
+| `TOTAL_STORAGE` | `10737418240` | 总存储空间限制（字节），默认 10GB |
+| `DATABASE_PATH` | `/app/data/r2box.db` | SQLite 数据库路径 |
 
-### 3. 首次配置
-
-1. 访问 `http://your-server-ip:9988`
-2. 输入 `ACCESS_TOKEN` 登录（默认在 docker-compose.yml 中配置）
-3. 在 R2 配置向导中填写步骤 1 记录的 R2 信息
-4. 测试连接 → 保存配置 → 开始使用！
-
-## 配置说明
-
-### docker-compose.yml
+### 配置示例
 
 ```yaml
 environment:
-  - ACCESS_TOKEN=your_secure_password_here  # 必须修改！访问口令
-  - PORT=9988                                # 服务端口
-  - MAX_FILE_SIZE=5368709120                 # 最大文件 5GB
-  - TOTAL_STORAGE=10737418240                # 总存储 10GB
+  - PORT=9988
+  - MAX_FILE_SIZE=5368709120           # 5GB
+  - TOTAL_STORAGE=10737418240          # 10GB
+  - DATABASE_PATH=/app/data/r2box.db
 ```
 
-## 常用命令
+---
+
+## 密码管理
+
+### 重置密码
+
+如果忘记密码，可以通过以下命令重置：
 
 ```bash
-# 启动
-docker compose up -d
+# 删除数据库中的密码记录，下次访问时会提示重新设置
+docker exec r2box sh -c "sqlite3 /app/data/r2box.db \"DELETE FROM system_config WHERE key='password_hash';\""
 
-# 查看日志
-docker compose logs -f
-
-# 停止
-docker compose down
-
-# 更新到最新版本
-docker compose pull && docker compose up -d
-
-# 从源码重新构建（需先修改 docker-compose.yml 启用 build）
-docker compose up -d --build
+# 或者直接删除数据库文件（会丢失所有数据）
+rm ./data/r2box.db
 ```
+
+重启容器后访问网页即可重新设置密码。
+
+---
 
 ## 技术栈
 
@@ -143,24 +185,98 @@ docker compose up -d --build
 
 ```
 r2box/
-├── backend/              # Go 后端
-├── frontend/             # Vue.js 前端
-├── img/                  # 截图
-├── Dockerfile
-├── docker-compose.yml
-└── r2-cors.json          # R2 CORS 配置
+├── backend/                 # Go 后端
+├── frontend/                # Vue.js 前端
+├── img/                     # 截图
+├── Dockerfile               # 多阶段构建
+├── docker-compose.yml       # 生产环境配置
+├── docker-compose.dev.yml   # 开发环境配置
+└── r2-cors.json             # R2 CORS 配置示例
 ```
+
+---
 
 ## 常见问题
 
-**Q: 上传失败？**
-- 检查 R2 CORS 是否配置
-- 查看浏览器控制台错误
+<details>
+<summary><b>Q: 上传失败？</b></summary>
 
-**Q: 无法访问？**
+- 检查 R2 CORS 是否正确配置
+- 查看浏览器控制台错误信息
+- 确认 R2 API Token 权限为 Object Read & Write
+
+</details>
+
+<details>
+<summary><b>Q: 无法访问服务？</b></summary>
+
 - 检查防火墙是否开放 9988 端口
-- `docker compose logs` 查看错误日志
+- 运行 `docker compose logs` 查看错误日志
+- 确认 Docker 容器正常运行：`docker ps`
+
+</details>
+
+<details>
+<summary><b>Q: 如何配置 R2 CORS？</b></summary>
+
+在 R2 存储桶设置中添加 CORS 规则，参考 `r2-cors.json`：
+
+```json
+[
+  {
+    "AllowedOrigins": ["*"],
+    "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+</details>
+
+<details>
+<summary><b>Q: 忘记密码怎么办？</b></summary>
+
+参考上方 [密码管理](#密码管理) 章节，使用 Docker 命令重置密码。
+
+</details>
+
+---
 
 ## 许可证
 
-MIT License
+[MIT License](LICENSE)
+
+## 功能状态
+
+### ✅ 已完成
+
+- [x] 前端直传 R2（预签名 URL）
+- [x] 大文件分片上传（支持 5GB）
+- [x] 文件自动过期清理（1/3/7/30 天）
+- [x] R2 预签名下载直链
+- [x] 首次访问设置密码（无需环境变量）
+- [x] 密码重置功能（Docker 命令）
+- [x] IP 速率限制 & 暴力破解防护
+- [x] 存储空间使用统计
+- [x] 文件短链接分享
+- [x] Web 界面 R2 配置向导
+- [x] Docker 一键部署
+
+### 🚧 待完成
+
+- [ ] 核实真实 R2 存储用量（当前为本地数据库累加）
+- [ ] 文件批量上传
+- [ ] 文件拖拽排序
+- [ ] 上传历史记录
+- [ ] 多用户支持
+- [ ] 文件预览（图片/视频）
+- [ ] 自定义过期时间
+- [ ] API 接口文档
+
+---
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！

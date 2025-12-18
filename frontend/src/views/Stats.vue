@@ -9,8 +9,18 @@
           </div>
         </div>
         <n-space align="center" :size="16">
-          <n-button quaternary @click="router.push('/')">📤 上传文件</n-button>
-          <n-button quaternary @click="router.push('/files')">📁 文件列表</n-button>
+          <n-button quaternary @click="router.push('/')">
+            <template #icon>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+            </template>
+            上传文件
+          </n-button>
+          <n-button quaternary @click="router.push('/files')">
+            <template #icon>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+            </template>
+            文件列表
+          </n-button>
           <n-button quaternary type="error" @click="handleLogout">退出</n-button>
         </n-space>
       </n-layout-header>
@@ -67,6 +77,9 @@
           <n-gi>
             <n-card title="使用提示">
               <n-space vertical>
+                <n-alert type="warning" title="用量说明">
+                  显示的存储用量基于本地数据库统计，可能与 R2 实际用量存在差异。
+                </n-alert>
                 <n-alert type="info" title="存储空间">
                   当前使用 Cloudflare R2 免费层，总容量 10GB。超出后可能产生费用。
                 </n-alert>

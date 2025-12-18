@@ -2,13 +2,21 @@ package middleware
 
 import (
 	"net/http"
+	"r2box/database"
 	"strings"
 )
 
 // AuthMiddleware 认证中间件
-func AuthMiddleware(accessToken string) func(http.Handler) http.Handler {
+func AuthMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 获取存储的密码哈希
+			storedHash, err := database.GetPasswordHash()
+			if err != nil || storedHash == "" {
+				http.Error(w, `{"error":"密码未设置"}`, http.StatusUnauthorized)
+				return
+			}
+
 			// 从 Authorization header 获取 token
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
@@ -28,7 +36,7 @@ func AuthMiddleware(accessToken string) func(http.Handler) http.Handler {
 			}
 
 			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token != accessToken {
+			if token != storedHash {
 				http.Error(w, `{"error":"无效的令牌"}`, http.StatusUnauthorized)
 				return
 			}
