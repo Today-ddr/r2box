@@ -11,8 +11,8 @@
 <p align="center">
   <a href="#特性">特性</a> •
   <a href="#快速开始">快速开始</a> •
+  <a href="#r2-cors-配置">CORS 配置</a> •
   <a href="#部署指南">部署指南</a> •
-  <a href="#环境变量">环境变量</a> •
   <a href="#常见问题">FAQ</a>
 </p>
 
@@ -65,7 +65,33 @@ curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.
 docker compose up -d
 ```
 
-### 3. 首次配置
+### 3. 配置 R2 CORS（必须）
+
+> ⚠️ **重要**：前端直传功能必须配置 CORS，否则上传会失败！
+
+<p align="center">
+  <img src="img/cors.png" alt="R2 CORS 配置" width="600" />
+</p>
+
+1. 在 Cloudflare Dashboard 进入你的 R2 存储桶
+2. 点击 **Settings（设置）** → 找到 **CORS Policy**
+3. 点击 **Edit CORS Policy**，粘贴以下配置：
+
+```json
+[
+  {
+    "AllowedOrigins": ["*"],
+    "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag", "Content-Length", "Content-Type"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+> 💡 生产环境建议将 `*` 改为你的实际域名，详见 [R2 CORS 配置](#r2-cors-配置) 章节。
+
+### 4. 首次配置
 
 1. 访问 `http://your-server-ip:9988`
 2. **首次访问会提示设置密码**（密码存储在数据库中）
@@ -196,6 +222,95 @@ r2box/
 
 ---
 
+## R2 CORS 配置
+
+前端直传功能需要在 Cloudflare R2 存储桶中配置 CORS（跨域资源共享）规则。
+
+### 配置步骤
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
+2. 进入 **R2 Object Storage** → 选择你的存储桶
+3. 点击 **Settings（设置）** 标签
+4. 找到 **CORS Policy** 部分，点击 **Edit CORS Policy**
+5. 粘贴下方配置并保存
+
+### 开发/测试环境配置（宽松）
+
+适用于本地开发和测试，允许所有来源访问：
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "*"
+    ],
+    "AllowedMethods": [
+      "GET",
+      "PUT",
+      "POST",
+      "DELETE",
+      "HEAD"
+    ],
+    "AllowedHeaders": [
+      "*"
+    ],
+    "ExposeHeaders": [
+      "ETag",
+      "Content-Length",
+      "Content-Type"
+    ],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+### 生产环境配置（推荐）
+
+限制只允许你的域名访问，更加安全：
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "https://your-domain.com",
+      "https://www.your-domain.com"
+    ],
+    "AllowedMethods": [
+      "GET",
+      "PUT",
+      "POST",
+      "DELETE",
+      "HEAD"
+    ],
+    "AllowedHeaders": [
+      "Content-Type",
+      "Content-MD5",
+      "x-amz-*"
+    ],
+    "ExposeHeaders": [
+      "ETag",
+      "Content-Length",
+      "Content-Type"
+    ],
+    "MaxAgeSeconds": 86400
+  }
+]
+```
+
+### 配置说明
+
+| 字段 | 说明 |
+|------|------|
+| `AllowedOrigins` | 允许访问的域名，`*` 表示所有域名，生产环境建议指定具体域名 |
+| `AllowedMethods` | 允许的 HTTP 方法，上传需要 `PUT`/`POST`，下载需要 `GET` |
+| `AllowedHeaders` | 允许的请求头，`*` 表示所有，生产环境可限制为必要的头 |
+| `ExposeHeaders` | 允许前端访问的响应头，`ETag` 用于分片上传校验 |
+| `MaxAgeSeconds` | 预检请求缓存时间（秒），减少 OPTIONS 请求次数 |
+
+> ⚠️ **安全提示**：生产环境强烈建议将 `AllowedOrigins` 设置为你的实际域名，避免使用 `*` 通配符。
+
+---
+
 ## 常见问题
 
 <details>
@@ -219,19 +334,22 @@ r2box/
 <details>
 <summary><b>Q: 如何配置 R2 CORS？</b></summary>
 
-在 R2 存储桶设置中添加 CORS 规则，参考 `r2-cors.json`：
+在 R2 存储桶设置中添加 CORS 规则，详细配置请参考上方 [R2 CORS 配置](#r2-cors-配置) 章节。
 
+快速配置（开发环境）：
 ```json
 [
   {
     "AllowedOrigins": ["*"],
     "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
     "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag"],
+    "ExposeHeaders": ["ETag", "Content-Length", "Content-Type"],
     "MaxAgeSeconds": 3600
   }
 ]
 ```
+
+> 💡 生产环境建议将 `AllowedOrigins` 改为你的实际域名。
 
 </details>
 
