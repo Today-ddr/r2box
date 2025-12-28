@@ -1,6 +1,9 @@
 # Stage 1: 构建前端
 FROM node:20-alpine AS frontend-builder
 
+# Accept version argument from CI/CD
+ARG APP_VERSION
+
 WORKDIR /app/frontend
 
 # 先复制依赖文件（利用 Docker 缓存）
@@ -8,6 +11,16 @@ COPY frontend/package*.json ./
 
 # 安装依赖（依赖不变时使用缓存）
 RUN npm install
+
+# 复制版本配置文件
+COPY version.json ../version.json
+
+# Update version.json if APP_VERSION is provided
+RUN if [ -n "$APP_VERSION" ]; then \
+      apk add --no-cache jq && \
+      jq --arg v "$APP_VERSION" '.version = $v' ../version.json > ../version.tmp.json && \
+      mv ../version.tmp.json ../version.json; \
+    fi
 
 # 再复制源码
 COPY frontend/ ./
