@@ -32,6 +32,7 @@
               <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
             </template>
           </n-button>
+          <VersionBadge />
           <n-button quaternary type="error" @click="handleLogout">退出</n-button>
         </n-space>
       </n-layout-header>
@@ -106,7 +107,17 @@
 
               <n-alert v-if="isUploading" type="info" style="margin-top: 16px;">
                 <template #header>
-                  上传中: {{ currentFile?.name }}
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>上传中: {{ currentFile?.name }}</span>
+                    <n-button
+                      size="small"
+                      type="error"
+                      :loading="isCancelling"
+                      @click="handleCancelUpload"
+                    >
+                      {{ isCancelling ? '取消中...' : '取消上传' }}
+                    </n-button>
+                  </div>
                 </template>
                 <n-progress
                   type="line"
@@ -218,6 +229,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import api from '../services/api'
+import VersionBadge from '../components/VersionBadge.vue'
 import {
   NLayout,
   NLayoutHeader,
@@ -251,6 +263,8 @@ const router = useRouter()
 const authStore = useAuthStore()
 const message = useMessage()
 
+const appVersion = __APP_VERSION__
+
 const uploadRef = ref(null)
 const expiresIn = ref(7)
 const uploadProgress = ref(0)
@@ -272,6 +286,12 @@ let uploadStartTime = 0
 let lastUpdateTime = 0
 let lastLoaded = 0
 let animationFrame = null
+
+// 上传取消相关
+let abortController = null
+const currentFileId = ref(null)
+const currentUploadId = ref(null)
+const isCancelling = ref(false)
 
 const formatBytes = (bytes) => {
   if (bytes === 0) return '0 B'
@@ -418,11 +438,60 @@ const beforeUpload = ({ file }) => {
   return true
 }
 
+// 取消上传
+const handleCancelUpload = async () => {
+  if (!isUploading.value || isCancelling.value) return
+
+  isCancelling.value = true
+
+  try {
+    // 1. 中断前端请求
+    if (abortController) {
+      abortController.abort()
+      abortController = null
+    }
+
+    // 2. 调用后端清理 R2 数据
+    if (currentFileId.value) {
+      await api.cancelUpload({
+        file_id: currentFileId.value,
+        upload_id: currentUploadId.value || ''
+      })
+    }
+
+    message.warning('上传已取消')
+    uploadResult.value = {
+      success: false,
+      message: '上传已被用户取消'
+    }
+  } catch (error) {
+    // 忽略 AbortError
+    if (error.name !== 'AbortError' && error.code !== 'ERR_CANCELED') {
+      console.error('取消上传时出错:', error)
+    }
+  } finally {
+    // 重置状态
+    isUploading.value = false
+    isCancelling.value = false
+    currentFileId.value = null
+    currentUploadId.value = null
+    if (animationFrame) {
+      cancelAnimationFrame(animationFrame)
+      animationFrame = null
+    }
+  }
+}
+
 const handleUpload = async ({ file }) => {
   currentFile.value = file
   uploadProgress.value = 0
   displayProgress.value = 0
   uploadResult.value = null
+
+  // 初始化 AbortController
+  abortController = new AbortController()
+  currentFileId.value = null
+  currentUploadId.value = null
 
   // 立即显示上传状态
   isUploading.value = true
@@ -448,13 +517,32 @@ const handleUpload = async ({ file }) => {
       await uploadLargeFile(file)
     }
   } catch (error) {
+    // 检查是否是取消操作
+    if (error.name === 'AbortError' || error.code === 'ERR_CANCELED') {
+      // 取消操作已在 handleCancelUpload 中处理
+      return
+    }
     console.error('上传错误:', error)
     uploadResult.value = {
       success: false,
       message: error.response?.data?.error || error.message || '上传失败'
     }
+    // 上传失败时清理 R2 数据
+    if (currentFileId.value) {
+      try {
+        await api.cancelUpload({
+          file_id: currentFileId.value,
+          upload_id: currentUploadId.value || ''
+        })
+      } catch (cleanupError) {
+        console.error('清理失败上传数据时出错:', cleanupError)
+      }
+    }
   } finally {
     isUploading.value = false
+    abortController = null
+    currentFileId.value = null
+    currentUploadId.value = null
     // 取消动画帧
     if (animationFrame) {
       cancelAnimationFrame(animationFrame)
@@ -472,10 +560,13 @@ const uploadSmallFile = async (file) => {
     expires_in: expiresIn.value
   })
 
-  // 直接上传到 R2
+  // 保存 file_id 用于取消操作
+  currentFileId.value = response.file_id
+
+  // 直接上传到 R2（传入 abort signal）
   await api.uploadToR2(response.upload_url, file.file, (percent, loaded, total) => {
     updateUploadStats(loaded, total)
-  })
+  }, abortController?.signal)
 
   // 计算上传统计
   const uploadEndTime = Date.now()
@@ -515,9 +606,15 @@ const uploadLargeFile = async (file) => {
   })
 
   const { file_id, upload_id, part_size, total_parts } = initResponse
+
+  // 保存 file_id 和 upload_id 用于取消操作
+  currentFileId.value = file_id
+  currentUploadId.value = upload_id
+
   const CONCURRENCY = 3 // 并发数
   let completedBytes = 0
   const partProgress = new Array(total_parts).fill(0) // 每个分片的进度
+  let isCancelled = false
 
   // 更新总进度
   const updateTotalProgress = () => {
@@ -525,8 +622,20 @@ const uploadLargeFile = async (file) => {
     updateUploadStats(totalLoaded, file.file.size)
   }
 
+  // 检查是否已取消
+  const checkCancelled = () => {
+    if (abortController?.signal?.aborted) {
+      isCancelled = true
+      const error = new Error('上传已取消')
+      error.name = 'AbortError'
+      throw error
+    }
+  }
+
   // 上传单个分片（带重试和实时进度）
   const uploadPart = async (partIndex) => {
+    checkCancelled()
+
     const partNumber = partIndex + 1
     const start = partIndex * part_size
     const end = Math.min(start + part_size, file.file.size)
@@ -534,6 +643,8 @@ const uploadLargeFile = async (file) => {
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        checkCancelled()
+
         // 获取分片预签名 URL
         const presignResponse = await api.getMultipartUploadURL({
           file_id,
@@ -541,11 +652,13 @@ const uploadLargeFile = async (file) => {
           part_number: partNumber
         })
 
-        // 上传分片（带实时进度）
+        checkCancelled()
+
+        // 上传分片（带实时进度和 abort signal）
         const uploadResponse = await api.uploadToR2(presignResponse.upload_url, chunk, (percent, loaded) => {
           partProgress[partIndex] = loaded
           updateTotalProgress()
-        })
+        }, abortController?.signal)
 
         // 获取 ETag
         let etag = uploadResponse.headers?.etag || ''
@@ -562,6 +675,10 @@ const uploadLargeFile = async (file) => {
 
         return { part_number: partNumber, etag }
       } catch (err) {
+        // 如果是取消操作，直接抛出
+        if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+          throw err
+        }
         if (attempt === 3) throw err
         await new Promise(r => setTimeout(r, 1000 * attempt))
       }
@@ -573,7 +690,8 @@ const uploadLargeFile = async (file) => {
   let currentIndex = 0
 
   const uploadNext = async () => {
-    while (currentIndex < total_parts) {
+    while (currentIndex < total_parts && !isCancelled) {
+      checkCancelled()
       const partIndex = currentIndex++
       try {
         const result = await uploadPart(partIndex)
@@ -848,5 +966,14 @@ const handleLogout = () => {
 /* 圆环进度条样式优化 */
 .storage-ring-container :deep(.n-progress-graph-circle-fill) {
   transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;
+}
+
+.version-tag {
+  font-size: 12px;
+  color: #6b7280;
+  background: #f3f4f6;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 </style>

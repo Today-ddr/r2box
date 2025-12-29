@@ -254,6 +254,25 @@ func (s *R2Service) DeleteObject(key string) error {
 	return err
 }
 
+// AbortMultipartUpload 终止分片上传
+func (s *R2Service) AbortMultipartUpload(key, uploadID string) error {
+	log.Printf("[R2] 终止分片上传: key=%s, uploadID=%s", key, uploadID)
+
+	_, err := s.client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.bucketName),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
+
+	if err != nil {
+		log.Printf("[R2] 终止分片上传失败: %v", err)
+		return err
+	}
+
+	log.Println("[R2] 分片上传已终止")
+	return nil
+}
+
 // TestConnection 测试 R2 连接
 func (s *R2Service) TestConnection() error {
 	log.Printf("[R2] 测试连接: bucket=%s", s.bucketName)

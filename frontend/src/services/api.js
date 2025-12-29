@@ -102,12 +102,18 @@ export default {
     return api.get('/stats')
   },
 
-  // 直接上传到 R2（使用预签名 URL）
-  uploadToR2(url, file, onProgress) {
+  // 取消上传
+  cancelUpload(data) {
+    return api.post('/upload/cancel', data)
+  },
+
+  // 直接上传到 R2（使用预签名 URL，支持 AbortController）
+  uploadToR2(url, file, onProgress, abortSignal) {
     return axios.put(url, file, {
       headers: {
         'Content-Type': file.type || 'application/octet-stream'
       },
+      signal: abortSignal,
       onUploadProgress: progressEvent => {
         if (onProgress) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total)

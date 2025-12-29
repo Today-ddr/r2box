@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// Version info (injected at build time via -ldflags)
+var (
+	Version   = "dev"
+	CommitSHA = "unknown"
+)
+
 // App 应用实例
 type App struct {
 	cfg       *config.Config
@@ -90,7 +96,7 @@ func (a *App) StartCleanupTask() {
 }
 
 func main() {
-	log.Println("[App] R2Box 启动中...")
+	log.Printf("[App] R2Box v%s (%s) 启动中...", Version, CommitSHA)
 
 	// 加载配置
 	cfg := config.Load()
@@ -225,6 +231,18 @@ func main() {
 		}
 		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
 		uploadHandler.ConfirmUpload(w, r)
+	})))
+
+	// 取消上传
+	mux.Handle("/api/upload/cancel", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] POST /api/upload/cancel")
+		r2Service := app.GetR2Service()
+		if r2Service == nil {
+			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
+			return
+		}
+		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
+		uploadHandler.CancelUpload(w, r)
 	})))
 
 	// 文件列表路由

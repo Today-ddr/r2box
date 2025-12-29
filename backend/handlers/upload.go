@@ -295,6 +295,18 @@ type MultipartCompleteResponse struct {
 	ExpiresAt   string `json:"expires_at"`
 }
 
+// CancelUploadRequest 取消上传请求
+type CancelUploadRequest struct {
+	FileID   string `json:"file_id"`
+	UploadID string `json:"upload_id,omitempty"` // 分片上传时需要
+}
+
+// CancelUploadResponse 取消上传响应
+type CancelUploadResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // CompleteMultipartUpload 完成分片上传
 func (h *UploadHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -360,5 +372,67 @@ func (h *UploadHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		DownloadURL: downloadURL,
 		ShortURL:    "/s/" + file.ShortCode,
 		ExpiresAt:   file.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// CancelUpload 取消上传
+func (h *UploadHandler) CancelUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CancelUploadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.FileID == "" {
+		http.Error(w, `{"error":"缺少 file_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[Upload] 取消上传: file_id=%s, upload_id=%s", req.FileID, req.UploadID)
+
+	// 获取文件记录
+	file, err := models.GetFileByID(h.db, req.FileID)
+	if err != nil {
+		log.Printf("[Upload] 文件不存在: %v", err)
+		// 文件不存在也返回成功，因为目标是清理
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CancelUploadResponse{
+			Success: true,
+			Message: "文件记录不存在，无需清理",
+		})
+		return
+	}
+
+	// 如果是分片上传，终止分片上传
+	if req.UploadID != "" {
+		if err := h.r2Service.AbortMultipartUpload(file.R2Key, req.UploadID); err != nil {
+			log.Printf("[Upload] 终止分片上传失败: %v", err)
+			// 继续执行，尝试删除可能已存在的对象
+		}
+	}
+
+	// 尝试删除 R2 中可能已存在的对象（小文件上传或部分完成的上传）
+	if err := h.r2Service.DeleteObject(file.R2Key); err != nil {
+		log.Printf("[Upload] 删除 R2 对象失败（可能不存在）: %v", err)
+		// 忽略错误，对象可能不存在
+	}
+
+	// 更新文件状态为已取消
+	file.UpdateStatus(h.db, "cancelled")
+
+	// 删除数据库记录
+	h.db.Exec("DELETE FROM files WHERE id = ?", req.FileID)
+
+	log.Printf("[Upload] 上传已取消: file_id=%s", req.FileID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CancelUploadResponse{
+		Success: true,
+		Message: "上传已取消，R2 数据已清理",
 	})
 }

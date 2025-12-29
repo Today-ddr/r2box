@@ -6,7 +6,7 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master, main]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -34,6 +34,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract version info
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(node -p "require('./frontend/package.json').version")-${GITHUB_SHA::7}
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -56,3 +67,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            COMMIT_SHA=${{ steps.version.outputs.commit_sha }}
