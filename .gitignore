@@ -36,3 +36,4 @@ yarn-error.log*
 
 # 日志
 *.log
+.ace-tool/
