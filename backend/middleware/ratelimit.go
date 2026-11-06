@@ -2,9 +2,14 @@ package middleware
 
 import (
 	"database/sql"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+
+	"r2box/httpx"
 )
 
 const (
@@ -14,21 +19,95 @@ const (
 	BlockDuration     = 5 * time.Minute
 )
 
+// trustedProxies 只有来自这些网段的请求才允许提供 X-Forwarded-For
+var trustedProxies []*net.IPNet
+
+// InitTrustedProxies 解析受信代理网段。为空时一律使用 RemoteAddr。
+func InitTrustedProxies(cidrs []string) error {
+	trustedProxies = nil
+	for _, raw := range cidrs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if !strings.Contains(raw, "/") {
+			if ip := net.ParseIP(raw); ip != nil {
+				if ip.To4() != nil {
+					raw += "/32"
+				} else {
+					raw += "/128"
+				}
+			}
+		}
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			return fmt.Errorf("无效的 TRUSTED_PROXIES 网段 %q: %w", raw, err)
+		}
+		trustedProxies = append(trustedProxies, network)
+	}
+	if len(trustedProxies) > 0 {
+		log.Printf("[RateLimit] 已信任 %d 个代理网段", len(trustedProxies))
+	}
+	return nil
+}
+
+func isTrusted(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, network := range trustedProxies {
+		if network.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetClientIP 获取客户端 IP。仅当直连方是受信代理时才解析 X-Forwarded-For，
+// 并从右往左取第一个非受信地址，避免客户端伪造头部绕过限流。
+func GetClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	if !isTrusted(host) {
+		return host
+	}
+
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return host
+	}
+
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip := strings.TrimSpace(parts[i])
+		if ip == "" {
+			continue
+		}
+		if !isTrusted(ip) {
+			return ip
+		}
+	}
+
+	return host
+}
+
 // RateLimitMiddleware 速率限制中间件
 func RateLimitMiddleware(db *sql.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := getClientIP(r)
+			ip := GetClientIP(r)
 
-			// 检查是否被锁定
 			if isBlocked(db, ip) {
-				http.Error(w, `{"error":"请求过于频繁，请稍后再试"}`, http.StatusTooManyRequests)
+				httpx.WriteJSONError(w, http.StatusTooManyRequests, "请求过于频繁，请稍后再试")
 				return
 			}
 
-			// 检查请求频率
 			if !allowRequest(db, ip) {
-				http.Error(w, `{"error":"请求频率超限"}`, http.StatusTooManyRequests)
+				httpx.WriteJSONError(w, http.StatusTooManyRequests, "请求频率超限")
 				return
 			}
 
@@ -37,143 +116,76 @@ func RateLimitMiddleware(db *sql.DB) func(http.Handler) http.Handler {
 	}
 }
 
-// getClientIP 获取客户端 IP
-func getClientIP(r *http.Request) string {
-	// 尝试从 X-Forwarded-For 获取
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := parseXFF(xff)
-		if len(ips) > 0 {
-			return ips[0]
-		}
-	}
-
-	// 尝试从 X-Real-IP 获取
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// 从 RemoteAddr 获取
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return ip
-}
-
-// parseXFF 解析 X-Forwarded-For header
-func parseXFF(xff string) []string {
-	var ips []string
-	for _, ip := range splitAndTrim(xff, ",") {
-		if ip != "" {
-			ips = append(ips, ip)
-		}
-	}
-	return ips
-}
-
-// splitAndTrim 分割并去除空格
-func splitAndTrim(s, sep string) []string {
-	var result []string
-	for _, item := range split(s, sep) {
-		trimmed := trim(item)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func split(s, sep string) []string {
-	// 简单实现，实际应使用 strings.Split
-	var result []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep[0] {
-			result = append(result, s[start:i])
-			start = i + 1
-		}
-	}
-	result = append(result, s[start:])
-	return result
-}
-
-func trim(s string) string {
-	// 简单实现，实际应使用 strings.TrimSpace
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
-}
-
 // isBlocked 检查 IP 是否被锁定
 func isBlocked(db *sql.DB, ip string) bool {
-	var blockedUntil sql.NullTime
-	err := db.QueryRow("SELECT blocked_until FROM rate_limits WHERE ip = ?", ip).Scan(&blockedUntil)
-
-	if err != nil || !blockedUntil.Valid {
+	var blockedUntil sql.NullInt64
+	if err := db.QueryRow("SELECT blocked_until_unix FROM rate_limits WHERE ip = ?", ip).Scan(&blockedUntil); err != nil {
 		return false
 	}
 
-	if time.Now().Before(blockedUntil.Time) {
+	if !blockedUntil.Valid {
+		return false
+	}
+
+	if time.Now().Unix() < blockedUntil.Int64 {
 		return true
 	}
 
-	// 锁定已过期，清除锁定状态
-	db.Exec("UPDATE rate_limits SET blocked_until = NULL, failed_attempts = 0 WHERE ip = ?", ip)
+	db.Exec("UPDATE rate_limits SET blocked_until_unix = NULL, failed_attempts = 0 WHERE ip = ?", ip)
 	return false
 }
 
-// allowRequest 检查是否允许请求
+// allowRequest 检查并累加请求计数，读写合并为一条语句
 func allowRequest(db *sql.DB, ip string) bool {
-	var requestCount int
-	var windowStart time.Time
+	now := time.Now().Unix()
+	window := int64(RateLimitWindow.Seconds())
 
-	err := db.QueryRow("SELECT request_count, window_start FROM rate_limits WHERE ip = ?", ip).Scan(&requestCount, &windowStart)
-
-	now := time.Now()
-
-	if err == sql.ErrNoRows {
-		// 首次请求
-		db.Exec("INSERT INTO rate_limits (ip, request_count, window_start) VALUES (?, 1, ?)", ip, now)
+	var count int
+	err := db.QueryRow(`
+		INSERT INTO rate_limits (ip, request_count, window_start_unix, failed_attempts)
+		VALUES (?, 1, ?, 0)
+		ON CONFLICT(ip) DO UPDATE SET
+			request_count = CASE WHEN ? - window_start_unix >= ? THEN 1 ELSE request_count + 1 END,
+			window_start_unix = CASE WHEN ? - window_start_unix >= ? THEN ? ELSE window_start_unix END
+		RETURNING request_count
+	`, ip, now, now, window, now, window, now).Scan(&count)
+	if err != nil {
+		// 限流自身出错时不阻断业务
+		log.Printf("[RateLimit] 计数失败: %v", err)
 		return true
 	}
 
-	// 检查时间窗口是否过期
-	if now.Sub(windowStart) > RateLimitWindow {
-		// 重置计数器
-		db.Exec("UPDATE rate_limits SET request_count = 1, window_start = ? WHERE ip = ?", now, ip)
-		return true
-	}
-
-	// 检查是否超过限制
-	if requestCount >= RateLimitMax {
-		return false
-	}
-
-	// 增加计数器
-	db.Exec("UPDATE rate_limits SET request_count = request_count + 1 WHERE ip = ?", ip)
-	return true
+	return count <= RateLimitMax
 }
 
 // RecordFailedAttempt 记录失败尝试
 func RecordFailedAttempt(db *sql.DB, ip string) {
-	var failedAttempts int
-	err := db.QueryRow("SELECT failed_attempts FROM rate_limits WHERE ip = ?", ip).Scan(&failedAttempts)
+	now := time.Now().Unix()
 
-	if err == sql.ErrNoRows {
-		db.Exec("INSERT INTO rate_limits (ip, failed_attempts) VALUES (?, 1)", ip)
+	var failedAttempts int
+	err := db.QueryRow(`
+		INSERT INTO rate_limits (ip, request_count, window_start_unix, failed_attempts)
+		VALUES (?, 0, ?, 1)
+		ON CONFLICT(ip) DO UPDATE SET failed_attempts = failed_attempts + 1
+		RETURNING failed_attempts
+	`, ip, now).Scan(&failedAttempts)
+	if err != nil {
+		log.Printf("[RateLimit] 记录失败尝试出错: %v", err)
 		return
 	}
 
-	failedAttempts++
-
 	if failedAttempts >= MaxFailedAttempts {
-		// 锁定 IP
-		blockedUntil := time.Now().Add(BlockDuration)
-		db.Exec("UPDATE rate_limits SET failed_attempts = ?, blocked_until = ? WHERE ip = ?", failedAttempts, blockedUntil, ip)
-	} else {
-		db.Exec("UPDATE rate_limits SET failed_attempts = ? WHERE ip = ?", failedAttempts, ip)
+		blockedUntil := time.Now().Add(BlockDuration).Unix()
+		db.Exec("UPDATE rate_limits SET blocked_until_unix = ? WHERE ip = ?", blockedUntil, ip)
 	}
+}
+
+// CleanupRateLimits 清理长时间无活动且未被锁定的限流记录
+func CleanupRateLimits(db *sql.DB, before time.Time) error {
+	_, err := db.Exec(`
+		DELETE FROM rate_limits
+		WHERE window_start_unix < ?
+		  AND (blocked_until_unix IS NULL OR blocked_until_unix < ?)
+	`, before.Unix(), time.Now().Unix())
+	return err
 }

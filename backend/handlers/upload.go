@@ -5,27 +5,103 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
+
+	"r2box/httpx"
 	"r2box/models"
 	"r2box/services"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // UploadHandler 上传处理器
 type UploadHandler struct {
-	db          *sql.DB
-	r2Service   *services.R2Service
-	maxFileSize int64
+	db           *sql.DB
+	r2Service    *services.R2Service
+	maxFileSize  int64
+	totalStorage int64
 }
 
 // NewUploadHandler 创建上传处理器
-func NewUploadHandler(db *sql.DB, r2Service *services.R2Service, maxFileSize int64) *UploadHandler {
+func NewUploadHandler(db *sql.DB, r2Service *services.R2Service, maxFileSize, totalStorage int64) *UploadHandler {
 	return &UploadHandler{
-		db:          db,
-		r2Service:   r2Service,
-		maxFileSize: maxFileSize,
+		db:           db,
+		r2Service:    r2Service,
+		maxFileSize:  maxFileSize,
+		totalStorage: totalStorage,
 	}
+}
+
+// admit 上传准入：体积与配额。
+// R2 不支持在预签名 URL 上约束体积，这里只能基于客户端声明做前置判断，
+// 真实大小在确认上传时用 HeadObject 复核。
+func (h *UploadHandler) admit(size int64) (int, string) {
+	if size <= 0 {
+		return http.StatusBadRequest, "文件大小无效"
+	}
+	if size > h.maxFileSize {
+		return http.StatusRequestEntityTooLarge, "文件大小超过限制"
+	}
+
+	committed, err := models.GetCommittedStorage(h.db)
+	if err != nil {
+		log.Printf("[Upload] 读取已用配额失败: %v", err)
+		return http.StatusInternalServerError, "读取存储用量失败"
+	}
+
+	if committed+size > h.totalStorage {
+		return http.StatusInsufficientStorage, "存储空间不足，请清理文件后重试"
+	}
+
+	return 0, ""
+}
+
+// verifyObject 确认对象真的落在 R2 上，并用真实大小覆盖声明值
+func (h *UploadHandler) verifyObject(file *models.File) (int, string) {
+	info, err := h.r2Service.HeadObject(file.R2Key)
+	if err != nil {
+		if services.IsNotFound(err) {
+			file.UpdateStatus(h.db, "failed")
+			return http.StatusBadRequest, "对象未上传成功"
+		}
+		log.Printf("[Upload] 读取对象信息失败: %v", err)
+		return http.StatusBadGateway, "存储服务暂时不可用，请重试"
+	}
+
+	committed, err := models.GetCommittedStorage(h.db)
+	if err != nil {
+		log.Printf("[Upload] 读取已用配额失败: %v", err)
+		return http.StatusInternalServerError, "读取存储用量失败"
+	}
+
+	// committed 里包含本条记录声明的 size，先扣掉再加真实值
+	if info.Size > h.maxFileSize || committed-file.Size+info.Size > h.totalStorage {
+		if delErr := h.r2Service.DeleteObject(file.R2Key); delErr != nil {
+			log.Printf("[Upload] 删除超限对象失败: %v", delErr)
+		}
+		file.UpdateStatus(h.db, "failed")
+
+		if info.Size > h.maxFileSize {
+			return http.StatusRequestEntityTooLarge, "文件大小超过限制，已拒绝"
+		}
+		return http.StatusInsufficientStorage, "存储空间不足，已拒绝"
+	}
+
+	contentType := info.ContentType
+	if contentType == "" {
+		contentType = file.ContentType
+	}
+
+	if err := file.SetActualSize(h.db, info.Size, contentType); err != nil {
+		log.Printf("[Upload] 更新文件大小失败: %v", err)
+	}
+
+	return 0, ""
+}
+
+// expiredStatus 判断记录是否还能被确认
+func expiredStatus(status string) bool {
+	return status == "deleted" || status == "cancelled"
 }
 
 // PresignRequest 预签名请求
@@ -45,29 +121,40 @@ type PresignResponse struct {
 	ExpiresAt   string `json:"expires_at"`
 }
 
+// DownloadPath 对外的下载入口，统一经过后端做过期校验后再跳转
+func DownloadPath(fileID string) string {
+	return "/api/files/" + fileID + "/download"
+}
+
+// normalizeExpiresIn 校验过期天数（支持30秒测试：-30表示30秒）
+func normalizeExpiresIn(v int) int {
+	switch v {
+	case -30, 1, 3, 7, 30:
+		return v
+	default:
+		return 7
+	}
+}
+
 // GeneratePresignURL 生成预签名上传 URL（小文件）
 func (h *UploadHandler) GeneratePresignURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req PresignRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
-	// 验证文件大小
-	if req.Size > h.maxFileSize {
-		http.Error(w, `{"error":"文件大小超过限制"}`, http.StatusBadRequest)
+	if status, msg := h.admit(req.Size); status != 0 {
+		httpx.WriteJSONError(w, status, msg)
 		return
 	}
 
-	// 验证过期时间（支持30秒测试：-30表示30秒）
-	if req.ExpiresIn != -30 && req.ExpiresIn != 1 && req.ExpiresIn != 3 && req.ExpiresIn != 7 && req.ExpiresIn != 30 {
-		req.ExpiresIn = 7 // 默认 7 天
-	}
+	req.ExpiresIn = normalizeExpiresIn(req.ExpiresIn)
 
 	// 创建文件记录
 	file := &models.File{
@@ -79,14 +166,15 @@ func (h *UploadHandler) GeneratePresignURL(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := file.Create(h.db); err != nil {
-		http.Error(w, `{"error":"创建文件记录失败"}`, http.StatusInternalServerError)
+		log.Printf("[Upload] 创建文件记录失败: %v", err)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "创建文件记录失败")
 		return
 	}
 
 	// 生成预签名上传 URL
 	uploadURL, err := h.r2Service.GenerateUploadURL(file.R2Key, req.ContentType, time.Hour)
 	if err != nil {
-		http.Error(w, `{"error":"生成上传 URL 失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "生成上传 URL 失败")
 		return
 	}
 
@@ -94,7 +182,7 @@ func (h *UploadHandler) GeneratePresignURL(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(PresignResponse{
 		FileID:      file.ID,
 		UploadURL:   uploadURL,
-		DownloadURL: "/api/files/" + file.ID + "/download",
+		DownloadURL: DownloadPath(file.ID),
 		ShortURL:    "/s/" + file.ShortCode,
 		ExpiresAt:   file.ExpiresAt.Format(time.RFC3339),
 	})
@@ -116,39 +204,41 @@ type ConfirmResponse struct {
 // ConfirmUpload 确认上传完成（小文件）
 func (h *UploadHandler) ConfirmUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req ConfirmRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, req.FileID)
 	if err != nil {
-		http.Error(w, `{"error":"文件不存在"}`, http.StatusNotFound)
+		httpx.WriteJSONError(w, http.StatusNotFound, "文件不存在")
 		return
 	}
 
-	// 更新文件状态
-	file.UpdateStatus(h.db, "completed")
+	if expiredStatus(file.UploadStatus) {
+		httpx.WriteJSONError(w, http.StatusGone, "该上传已失效，请重新上传")
+		return
+	}
 
-	// 生成 R2 预签名下载直链（有效期与文件过期时间一致）
-	downloadURL, err := h.r2Service.GenerateDownloadURL(file.R2Key, file.Filename, time.Until(file.ExpiresAt))
-	if err != nil {
-		log.Printf("[Upload] 生成下载 URL 失败: %v", err)
-		// 即使生成失败也返回成功，使用备用链接
-		downloadURL = "/api/files/" + file.ID + "/download"
+	if status, msg := h.verifyObject(file); status != 0 {
+		httpx.WriteJSONError(w, status, msg)
+		return
+	}
+
+	if err := file.UpdateStatus(h.db, "completed"); err != nil {
+		log.Printf("[Upload] 更新状态失败: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ConfirmResponse{
 		Success:     true,
 		Message:     "上传确认成功",
-		DownloadURL: downloadURL,
+		DownloadURL: DownloadPath(file.ID),
 		ShortURL:    "/s/" + file.ShortCode,
 	})
 }
@@ -169,31 +259,39 @@ type MultipartInitResponse struct {
 	TotalParts int    `json:"total_parts"`
 }
 
+// calcPartSize 在 20MiB 和「不超过 9000 个分片」之间取较大者
+func calcPartSize(size int64) int64 {
+	const (
+		defaultPartSize = 20 << 20
+		maxParts        = 9000
+	)
+	partSize := int64(defaultPartSize)
+	if needed := (size + maxParts - 1) / maxParts; needed > partSize {
+		partSize = needed
+	}
+	return partSize
+}
+
 // InitiateMultipartUpload 初始化分片上传
 func (h *UploadHandler) InitiateMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req MultipartInitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
-	// 验证文件大小
-	if req.Size > h.maxFileSize {
-		http.Error(w, `{"error":"文件大小超过限制"}`, http.StatusBadRequest)
+	if status, msg := h.admit(req.Size); status != 0 {
+		httpx.WriteJSONError(w, status, msg)
 		return
 	}
 
-	// 验证过期时间（支持30秒测试：-30表示30秒）
-	if req.ExpiresIn != -30 && req.ExpiresIn != 1 && req.ExpiresIn != 3 && req.ExpiresIn != 7 && req.ExpiresIn != 30 {
-		req.ExpiresIn = 7
-	}
+	req.ExpiresIn = normalizeExpiresIn(req.ExpiresIn)
 
-	// 创建文件记录
 	file := &models.File{
 		Filename:     req.Filename,
 		Size:         req.Size,
@@ -203,23 +301,25 @@ func (h *UploadHandler) InitiateMultipartUpload(w http.ResponseWriter, r *http.R
 	}
 
 	if err := file.Create(h.db); err != nil {
-		http.Error(w, `{"error":"创建文件记录失败"}`, http.StatusInternalServerError)
+		log.Printf("[Upload] 创建文件记录失败: %v", err)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "创建文件记录失败")
 		return
 	}
 
-	// 初始化分片上传
 	uploadID, err := h.r2Service.InitiateMultipartUpload(file.R2Key, req.ContentType)
 	if err != nil {
-		http.Error(w, `{"error":"初始化分片上传失败"}`, http.StatusInternalServerError)
+		file.UpdateStatus(h.db, "failed")
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "初始化分片上传失败")
 		return
 	}
 
-	// 计算分片信息
-	partSize := int64(20 * 1024 * 1024) // 20MB
-	totalParts := int((req.Size + partSize - 1) / partSize)
+	// uploadID 必须落库，否则前端一刷新就再也无法 complete 或 abort
+	if err := file.SetUploadID(h.db, uploadID); err != nil {
+		log.Printf("[Upload] 保存 uploadID 失败: %v", err)
+	}
 
-	// 保存 uploadID 到数据库
-	h.db.Exec("UPDATE files SET upload_status = 'uploading' WHERE id = ?", file.ID)
+	partSize := calcPartSize(req.Size)
+	totalParts := int((req.Size + partSize - 1) / partSize)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(MultipartInitResponse{
@@ -243,30 +343,45 @@ type MultipartPresignResponse struct {
 	PartNumber int32  `json:"part_number"`
 }
 
+// resolveUploadID 以数据库中的 uploadID 为准，请求体与之冲突时拒绝
+func resolveUploadID(file *models.File, requested string) (string, bool) {
+	if file.UploadID == "" {
+		return requested, requested != ""
+	}
+	if requested == "" || requested == file.UploadID {
+		return file.UploadID, true
+	}
+	return "", false
+}
+
 // GenerateMultipartPresignURL 生成分片预签名 URL
 func (h *UploadHandler) GenerateMultipartPresignURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req MultipartPresignRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, req.FileID)
 	if err != nil {
-		http.Error(w, `{"error":"文件不存在"}`, http.StatusNotFound)
+		httpx.WriteJSONError(w, http.StatusNotFound, "文件不存在")
 		return
 	}
 
-	// 生成分片预签名 URL
-	uploadURL, err := h.r2Service.GenerateMultipartUploadURL(file.R2Key, req.UploadID, req.PartNumber)
+	uploadID, ok := resolveUploadID(file, req.UploadID)
+	if !ok {
+		httpx.WriteJSONError(w, http.StatusBadRequest, "upload_id 不匹配")
+		return
+	}
+
+	uploadURL, err := h.r2Service.GenerateMultipartUploadURL(file.R2Key, uploadID, req.PartNumber)
 	if err != nil {
-		http.Error(w, `{"error":"生成分片上传 URL 失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "生成分片上传 URL 失败")
 		return
 	}
 
@@ -310,34 +425,42 @@ type CancelUploadResponse struct {
 // CompleteMultipartUpload 完成分片上传
 func (h *UploadHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req MultipartCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[Upload] 解析请求失败: %v", err)
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
-
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, req.FileID)
 	if err != nil {
-		http.Error(w, `{"error":"文件不存在"}`, http.StatusNotFound)
+		httpx.WriteJSONError(w, http.StatusNotFound, "文件不存在")
 		return
 	}
 
-	// 获取 R2 中实际存在的分片并完成上传
-	r2Parts, err := h.r2Service.ListParts(file.R2Key, req.UploadID)
+	if expiredStatus(file.UploadStatus) {
+		httpx.WriteJSONError(w, http.StatusGone, "该上传已失效，请重新上传")
+		return
+	}
+
+	uploadID, ok := resolveUploadID(file, req.UploadID)
+	if !ok {
+		httpx.WriteJSONError(w, http.StatusBadRequest, "upload_id 不匹配")
+		return
+	}
+
+	// 以 R2 中实际存在的分片为准，避免客户端漏传或乱序
+	r2Parts, err := h.r2Service.ListParts(file.R2Key, uploadID)
 	if err != nil {
 		log.Printf("[Upload] 列出分片失败: %v", err)
-		http.Error(w, `{"error":"列出分片失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "列出分片失败")
 		return
 	}
 
-	// 使用 R2 返回的分片信息来完成上传
 	var completeParts []types.CompletedPart
 	for _, p := range r2Parts {
 		partNum := *p.PartNumber
@@ -348,28 +471,25 @@ func (h *UploadHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		})
 	}
 
-	// 完成分片上传
-	if err := h.r2Service.CompleteMultipartUpload(file.R2Key, req.UploadID, completeParts); err != nil {
+	if err := h.r2Service.CompleteMultipartUpload(file.R2Key, uploadID, completeParts); err != nil {
 		log.Printf("[Upload] 完成分片上传失败: %v", err)
-		http.Error(w, `{"error":"完成分片上传失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "完成分片上传失败")
 		return
 	}
 
-	// 更新文件状态
-	file.UpdateStatus(h.db, "completed")
+	if status, msg := h.verifyObject(file); status != 0 {
+		httpx.WriteJSONError(w, status, msg)
+		return
+	}
 
-	// 生成 R2 预签名下载直链（有效期与文件过期时间一致）
-	downloadURL, err := h.r2Service.GenerateDownloadURL(file.R2Key, file.Filename, time.Until(file.ExpiresAt))
-	if err != nil {
-		log.Printf("[Upload] 生成下载 URL 失败: %v", err)
-		// 即使生成失败也返回成功，使用备用链接
-		downloadURL = "/api/files/" + file.ID + "/download"
+	if err := file.UpdateStatus(h.db, "completed"); err != nil {
+		log.Printf("[Upload] 更新状态失败: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(MultipartCompleteResponse{
 		FileID:      file.ID,
-		DownloadURL: downloadURL,
+		DownloadURL: DownloadPath(file.ID),
 		ShortURL:    "/s/" + file.ShortCode,
 		ExpiresAt:   file.ExpiresAt.Format(time.RFC3339),
 	})
@@ -378,27 +498,25 @@ func (h *UploadHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 // CancelUpload 取消上传
 func (h *UploadHandler) CancelUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
 	var req CancelUploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 
 	if req.FileID == "" {
-		http.Error(w, `{"error":"缺少 file_id"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "缺少 file_id")
 		return
 	}
 
-	log.Printf("[Upload] 取消上传: file_id=%s, upload_id=%s", req.FileID, req.UploadID)
+	log.Printf("[Upload] 取消上传: file_id=%s", req.FileID)
 
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, req.FileID)
 	if err != nil {
-		log.Printf("[Upload] 文件不存在: %v", err)
 		// 文件不存在也返回成功，因为目标是清理
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(CancelUploadResponse{
@@ -408,9 +526,15 @@ func (h *UploadHandler) CancelUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uploadID, ok := resolveUploadID(file, req.UploadID)
+	if !ok {
+		httpx.WriteJSONError(w, http.StatusBadRequest, "upload_id 不匹配")
+		return
+	}
+
 	// 如果是分片上传，终止分片上传
-	if req.UploadID != "" {
-		if err := h.r2Service.AbortMultipartUpload(file.R2Key, req.UploadID); err != nil {
+	if uploadID != "" {
+		if err := h.r2Service.AbortMultipartUpload(file.R2Key, uploadID); err != nil {
 			log.Printf("[Upload] 终止分片上传失败: %v", err)
 			// 继续执行，尝试删除可能已存在的对象
 		}
@@ -418,15 +542,16 @@ func (h *UploadHandler) CancelUpload(w http.ResponseWriter, r *http.Request) {
 
 	// 尝试删除 R2 中可能已存在的对象（小文件上传或部分完成的上传）
 	if err := h.r2Service.DeleteObject(file.R2Key); err != nil {
-		log.Printf("[Upload] 删除 R2 对象失败（可能不存在）: %v", err)
-		// 忽略错误，对象可能不存在
+		log.Printf("[Upload] 删除 R2 对象失败: %v", err)
 	}
 
 	// 更新文件状态为已取消
 	file.UpdateStatus(h.db, "cancelled")
 
 	// 删除数据库记录
-	h.db.Exec("DELETE FROM files WHERE id = ?", req.FileID)
+	if _, err := h.db.Exec("DELETE FROM files WHERE id = ?", req.FileID); err != nil {
+		log.Printf("[Upload] 删除文件记录失败: %v", err)
+	}
 
 	log.Printf("[Upload] 上传已取消: file_id=%s", req.FileID)
 

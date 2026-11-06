@@ -12,10 +12,12 @@ services:
       - MAX_FILE_SIZE=5368709120
       - TOTAL_STORAGE=10737418240
       - DATABASE_PATH=/app/data/r2box.db
+      # 若前面挂了 nginx/caddy 等反向代理，把它的地址填进来，否则限流会把所有请求算到代理头上
+      # - TRUSTED_PROXIES=127.0.0.1/32
     mem_limit: 450m
     cpus: 2
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9988/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9988/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3

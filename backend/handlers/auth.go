@@ -53,7 +53,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 验证密码
 	inputHash := hashPassword(req.Password)
 	if inputHash != storedHash {
-		ip := getClientIP(r)
+		ip := middleware.GetClientIP(r)
 		middleware.RecordFailedAttempt(h.db, ip)
 
 		w.WriteHeader(http.StatusUnauthorized)
@@ -102,7 +102,6 @@ func (h *AuthHandler) SetupPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
 		return
 	}
-
 
 	// 保存密码哈希
 	hash := hashPassword(req.Password)
@@ -166,14 +165,4 @@ func checkR2Configured(db *sql.DB) bool {
 func hashPassword(password string) string {
 	hash := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(hash[:])
-}
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	return r.RemoteAddr
 }

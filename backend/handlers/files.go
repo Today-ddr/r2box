@@ -4,11 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"r2box/models"
-	"r2box/services"
 	"strconv"
 	"strings"
 	"time"
+
+	"r2box/httpx"
+	"r2box/models"
+	"r2box/services"
 )
 
 // FilesHandler 文件管理处理器
@@ -25,7 +27,7 @@ func NewFilesHandler(db *sql.DB, r2Service *services.R2Service) *FilesHandler {
 	}
 }
 
-// FileListItemWithURL 文件列表项（包含 R2 直链）
+// FileListItemWithURL 文件列表项（包含下载入口）
 type FileListItemWithURL struct {
 	models.FileListItem
 	DownloadURL string `json:"download_url"`
@@ -42,7 +44,7 @@ type ListResponse struct {
 // List 获取文件列表
 func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
@@ -57,28 +59,18 @@ func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 		limit = 20
 	}
 
-	// 获取文件列表
 	files, total, err := models.ListFiles(h.db, page, limit)
 	if err != nil {
-		http.Error(w, `{"error":"获取文件列表失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "获取文件列表失败")
 		return
 	}
 
-	// 为每个文件生成 R2 预签名直链
+	// 下载统一走后端 302，这里只给出本站入口，不再签发 R2 直链
 	filesWithURL := make([]FileListItemWithURL, len(files))
 	for i, file := range files {
-		filesWithURL[i] = FileListItemWithURL{
-			FileListItem: file,
-		}
-		// 只为未过期且已完成的文件生成直链
+		filesWithURL[i] = FileListItemWithURL{FileListItem: file}
 		if file.UploadStatus == "completed" && time.Now().Before(file.ExpiresAt) {
-			downloadURL, err := h.r2Service.GenerateDownloadURL(file.R2Key, file.Filename, time.Until(file.ExpiresAt))
-			if err == nil {
-				filesWithURL[i].DownloadURL = downloadURL
-			} else {
-				// 生成失败时使用备用链接
-				filesWithURL[i].DownloadURL = "/api/files/" + file.ID + "/download"
-			}
+			filesWithURL[i].DownloadURL = DownloadPath(file.ID)
 		}
 	}
 
@@ -91,78 +83,76 @@ func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetDownloadURL 获取下载 URL
+// GetDownloadURL 校验后临时签发并跳转
 func (h *FilesHandler) GetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
-	// 从 URL 路径中提取文件 ID
 	// /api/files/:id/download
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 	fileID := parts[3]
 
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, fileID)
 	if err != nil {
-		http.Error(w, `{"error":"文件不存在"}`, http.StatusNotFound)
+		httpx.WriteJSONError(w, http.StatusNotFound, "文件不存在")
 		return
 	}
 
-	// 检查文件是否已过期
+	if file.UploadStatus != "completed" {
+		httpx.WriteJSONError(w, http.StatusGone, "文件不可用")
+		return
+	}
+
 	if time.Now().After(file.ExpiresAt) {
-		http.Error(w, `{"error":"文件已过期"}`, http.StatusGone)
+		httpx.WriteJSONError(w, http.StatusGone, "文件已过期")
 		return
 	}
 
-	// 生成下载预签名 URL（使用原始文件名）
-	downloadURL, err := h.r2Service.GenerateDownloadURL(file.R2Key, file.Filename, 24*time.Hour)
+	// 只签 5 分钟：外链语义由本站地址保证，R2 直链越短越安全
+	downloadURL, err := h.r2Service.GenerateDownloadURL(file.R2Key, file.Filename, 5*time.Minute)
 	if err != nil {
-		http.Error(w, `{"error":"生成下载 URL 失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "生成下载链接失败")
 		return
 	}
 
-	// 重定向到预签名 URL
 	http.Redirect(w, r, downloadURL, http.StatusFound)
 }
 
 // Delete 删除文件
 func (h *FilesHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
+		httpx.WriteJSONError(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
 
-	// 从 URL 路径中提取文件 ID
 	// /api/files/:id
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 {
-		http.Error(w, `{"error":"无效的请求"}`, http.StatusBadRequest)
+		httpx.WriteJSONError(w, http.StatusBadRequest, "无效的请求")
 		return
 	}
 	fileID := parts[3]
 
-	// 获取文件记录
 	file, err := models.GetFileByID(h.db, fileID)
 	if err != nil {
-		http.Error(w, `{"error":"文件不存在"}`, http.StatusNotFound)
+		httpx.WriteJSONError(w, http.StatusNotFound, "文件不存在")
 		return
 	}
 
-	// 从 R2 删除对象
+	// 对象可能已经被过期清理删掉了，这里的删除应该是幂等的
 	if err := h.r2Service.DeleteObject(file.R2Key); err != nil {
-		http.Error(w, `{"error":"删除文件失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "删除文件失败")
 		return
 	}
 
-	// 从数据库删除记录
 	if err := models.DeleteFile(h.db, fileID); err != nil {
-		http.Error(w, `{"error":"删除文件记录失败"}`, http.StatusInternalServerError)
+		httpx.WriteJSONError(w, http.StatusInternalServerError, "删除文件记录失败")
 		return
 	}
 

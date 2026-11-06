@@ -65,6 +65,9 @@
                     <n-descriptions-item label="总空间">
                       <n-text>{{ stats.totalSpaceFormatted }}</n-text>
                     </n-descriptions-item>
+                    <n-descriptions-item label="上传中">
+                      <n-text type="warning">{{ stats.inFlightFormatted }}</n-text>
+                    </n-descriptions-item>
                     <n-descriptions-item label="文件数量">
                       <n-text strong>{{ stats.fileCount }}</n-text>
                     </n-descriptions-item>

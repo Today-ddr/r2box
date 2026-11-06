@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
 	"r2box/config"
 	"r2box/database"
 	"r2box/handlers"
+	"r2box/httpx"
 	"r2box/middleware"
 	"r2box/models"
 	"r2box/services"
-	"sync"
-	"time"
 )
 
 // Version info (injected at build time via -ldflags)
@@ -53,55 +59,115 @@ func (a *App) ReloadR2Service() {
 	log.Println("[App] R2 服务重新加载成功")
 }
 
-// StartCleanupTask 启动过期文件清理任务
-func (a *App) StartCleanupTask() {
-	cleanup := func() {
-		r2Service := a.GetR2Service()
-		if r2Service == nil {
-			return
-		}
-
-		files, err := models.GetExpiredFiles(database.DB)
-		if err != nil {
-			log.Printf("[Cleanup] 获取过期文件失败: %v", err)
-			return
-		}
-
-		for _, file := range files {
-			// 删除 R2 对象
-			if err := r2Service.DeleteObject(file.R2Key); err != nil {
-				log.Printf("[Cleanup] 删除 R2 对象失败: %s, %v", file.R2Key, err)
-				continue
-			}
-			// 标记为已删除（保留记录）
-			if err := file.UpdateStatus(database.DB, "deleted"); err != nil {
-				log.Printf("[Cleanup] 更新状态失败: %s, %v", file.ID, err)
-				continue
-			}
-			log.Printf("[Cleanup] 已清理过期文件: %s (%s)", file.Filename, file.ID)
-		}
-	}
-
+// StartCleanupTask 启动定期清理任务
+func (a *App) StartCleanupTask(ctx context.Context) {
 	go func() {
-		// 启动时立即执行一次清理
-		cleanup()
+		a.runCleanup()
 
-		ticker := time.NewTicker(1 * time.Hour) // 每小时检查一次
+		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			cleanup()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[Cleanup] 清理任务已停止")
+				return
+			case <-ticker.C:
+				a.runCleanup()
+			}
 		}
 	}()
+}
+
+func (a *App) runCleanup() {
+	r2Service := a.GetR2Service()
+	if r2Service == nil {
+		return
+	}
+
+	a.cleanupExpired(r2Service)
+	a.cleanupStaleUploads(r2Service)
+
+	if removed, err := models.DeleteStaleFailed(database.DB, time.Now().Add(-7*24*time.Hour)); err != nil {
+		log.Printf("[Cleanup] 删除陈旧失败记录失败: %v", err)
+	} else if removed > 0 {
+		log.Printf("[Cleanup] 已删除 %d 条陈旧失败记录", removed)
+	}
+
+	if err := middleware.CleanupRateLimits(database.DB, time.Now().Add(-1*time.Hour)); err != nil {
+		log.Printf("[Cleanup] 清理限流记录失败: %v", err)
+	}
+}
+
+// cleanupExpired 删除已过期的对象，记录保留为 deleted
+func (a *App) cleanupExpired(r2Service *services.R2Service) {
+	files, err := models.GetExpiredFiles(database.DB)
+	if err != nil {
+		log.Printf("[Cleanup] 获取过期文件失败: %v", err)
+		return
+	}
+
+	for _, file := range files {
+		if err := r2Service.DeleteObject(file.R2Key); err != nil {
+			log.Printf("[Cleanup] 删除 R2 对象失败: %s, %v", file.R2Key, err)
+			continue
+		}
+		if err := file.UpdateStatus(database.DB, "deleted"); err != nil {
+			log.Printf("[Cleanup] 更新状态失败: %s, %v", file.ID, err)
+			continue
+		}
+		log.Printf("[Cleanup] 已清理过期文件: %s (%s)", file.Filename, file.ID)
+	}
+}
+
+// cleanupStaleUploads 回收中断的上传：中止分片、删除残留对象、释放配额
+func (a *App) cleanupStaleUploads(r2Service *services.R2Service) {
+	// 基准是创建时间：中断的上传不应该占着配额等到文件过期
+	files, err := models.GetStaleUploads(database.DB, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		log.Printf("[Cleanup] 获取超时上传失败: %v", err)
+		return
+	}
+
+	for _, file := range files {
+		if file.UploadID != "" {
+			if err := r2Service.AbortMultipartUpload(file.R2Key, file.UploadID); err != nil {
+				log.Printf("[Cleanup] 终止分片上传失败: %s, %v", file.ID, err)
+			}
+		}
+		if err := r2Service.DeleteObject(file.R2Key); err != nil {
+			log.Printf("[Cleanup] 删除残留对象失败: %s, %v", file.ID, err)
+		}
+		if err := file.UpdateStatus(database.DB, "failed"); err != nil {
+			log.Printf("[Cleanup] 标记超时上传失败: %s, %v", file.ID, err)
+			continue
+		}
+		log.Printf("[Cleanup] 已回收中断上传: %s (%s)", file.Filename, file.ID)
+	}
+}
+
+// healthz 健康检查：数据库可用即视为健康
+func healthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := database.DB.Ping(); err != nil {
+		log.Printf("[Health] 数据库不可用: %v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy"})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func main() {
 	log.Printf("[App] R2Box v%s (%s) 启动中...", Version, CommitSHA)
 
-	// 加载配置
 	cfg := config.Load()
 
-	// 初始化数据库
+	if err := middleware.InitTrustedProxies(cfg.TrustedProxies); err != nil {
+		log.Fatalf("[App] 初始化受信代理失败: %v", err)
+	}
+
 	if err := database.Init(cfg.DatabasePath); err != nil {
 		log.Fatalf("[App] 数据库初始化失败: %v", err)
 	}
@@ -109,10 +175,8 @@ func main() {
 
 	log.Println("[App] 数据库初始化成功")
 
-	// 创建应用实例
 	app := &App{cfg: cfg}
 
-	// 尝试初始化 R2 服务
 	r2Configured, _ := database.IsR2Configured()
 	if r2Configured {
 		r2Service, err := services.NewR2Service(database.DB)
@@ -126,135 +190,73 @@ func main() {
 		log.Println("[App] R2 尚未配置，等待用户配置")
 	}
 
-	// 创建路由器
 	mux := http.NewServeMux()
 
-	// 创建认证处理器
 	authHandler := handlers.NewAuthHandler(database.DB)
 
 	// 公开路由（无需认证）
-	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/auth/login")
-		authHandler.Login(w, r)
-	})
-
-	mux.HandleFunc("/api/auth/setup-password", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/auth/setup-password")
-		authHandler.SetupPassword(w, r)
-	})
-
-	mux.HandleFunc("/api/auth/password-status", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] GET /api/auth/password-status")
-		authHandler.CheckPasswordStatus(w, r)
-	})
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/api/auth/login", authHandler.Login)
+	mux.HandleFunc("/api/auth/setup-password", authHandler.SetupPassword)
+	mux.HandleFunc("/api/auth/password-status", authHandler.CheckPasswordStatus)
 
 	// R2 配置向导（带配置变更回调）
 	setupHandler := handlers.NewSetupHandler(database.DB, func() {
 		app.ReloadR2Service()
 	})
 
-	// 认证状态
-	mux.Handle("/api/auth/status", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] GET /api/auth/status")
-		authHandler.Status(w, r)
-	})))
+	mux.Handle("/api/auth/status", middleware.AuthMiddleware()(http.HandlerFunc(authHandler.Status)))
+	mux.Handle("/api/setup/status", middleware.AuthMiddleware()(http.HandlerFunc(setupHandler.Status)))
+	mux.Handle("/api/setup/config", middleware.AuthMiddleware()(http.HandlerFunc(setupHandler.SaveConfig)))
+	mux.Handle("/api/setup/test", middleware.AuthMiddleware()(http.HandlerFunc(setupHandler.TestConnection)))
 
-	// R2 配置向导路由
-	mux.Handle("/api/setup/status", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] GET /api/setup/status")
-		setupHandler.Status(w, r)
-	})))
-
-	mux.Handle("/api/setup/config", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/setup/config")
-		setupHandler.SaveConfig(w, r)
-	})))
-
-	mux.Handle("/api/setup/test", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/setup/test")
-		setupHandler.TestConnection(w, r)
-	})))
-
-	// 上传路由（动态获取 R2 服务）
-	mux.Handle("/api/upload/presign", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/presign")
+	// uploadHandler 每次请求按当前 R2 服务构造，支持配置热更新
+	uploadHandler := func() *handlers.UploadHandler {
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
-			log.Println("[API] R2 服务未初始化")
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
+			return nil
 		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.GeneratePresignURL(w, r)
-	})))
+		return handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize, cfg.TotalStorage)
+	}
 
-	mux.Handle("/api/upload/multipart/init", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/multipart/init")
-		r2Service := app.GetR2Service()
-		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
-		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.InitiateMultipartUpload(w, r)
-	})))
+	withR2 := func(fn func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request)) http.Handler {
+		return middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := uploadHandler()
+			if h == nil {
+				httpx.WriteJSONError(w, http.StatusServiceUnavailable, "R2 未配置，请先完成配置")
+				return
+			}
+			fn(h, w, r)
+		}))
+	}
 
-	mux.Handle("/api/upload/multipart/presign", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/multipart/presign")
-		r2Service := app.GetR2Service()
-		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
-		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.GenerateMultipartPresignURL(w, r)
-	})))
-
-	mux.Handle("/api/upload/multipart/complete", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/multipart/complete")
-		r2Service := app.GetR2Service()
-		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
-		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.CompleteMultipartUpload(w, r)
-	})))
-
-	// 确认上传完成（小文件）
-	mux.Handle("/api/upload/confirm", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/confirm")
-		r2Service := app.GetR2Service()
-		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
-		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.ConfirmUpload(w, r)
-	})))
-
-	// 取消上传
-	mux.Handle("/api/upload/cancel", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] POST /api/upload/cancel")
-		r2Service := app.GetR2Service()
-		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
-			return
-		}
-		uploadHandler := handlers.NewUploadHandler(database.DB, r2Service, cfg.MaxFileSize)
-		uploadHandler.CancelUpload(w, r)
-	})))
+	mux.Handle("/api/upload/presign", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.GeneratePresignURL(w, r)
+	}))
+	mux.Handle("/api/upload/multipart/init", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.InitiateMultipartUpload(w, r)
+	}))
+	mux.Handle("/api/upload/multipart/presign", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.GenerateMultipartPresignURL(w, r)
+	}))
+	mux.Handle("/api/upload/multipart/complete", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.CompleteMultipartUpload(w, r)
+	}))
+	mux.Handle("/api/upload/confirm", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.ConfirmUpload(w, r)
+	}))
+	mux.Handle("/api/upload/cancel", withR2(func(h *handlers.UploadHandler, w http.ResponseWriter, r *http.Request) {
+		h.CancelUpload(w, r)
+	}))
 
 	// 文件列表路由
 	mux.Handle("/api/files", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] GET /api/files")
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
+			httpx.WriteJSONError(w, http.StatusServiceUnavailable, "R2 未配置，请先完成配置")
 			return
 		}
-		filesHandler := handlers.NewFilesHandler(database.DB, r2Service)
-		filesHandler.List(w, r)
+		handlers.NewFilesHandler(database.DB, r2Service).List(w, r)
 	})))
 
 	// 短链接访问路由
@@ -271,33 +273,27 @@ func main() {
 			return
 		}
 
-		http.Redirect(w, r, "/api/files/"+file.ID+"/download", http.StatusFound)
+		http.Redirect(w, r, handlers.DownloadPath(file.ID), http.StatusFound)
 	})
 
 	// 文件下载和删除路由
 	mux.HandleFunc("/api/files/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] %s /api/files/...", r.Method)
 		r2Service := app.GetR2Service()
 		if r2Service == nil {
-			http.Error(w, `{"error":"R2 未配置，请先完成配置"}`, http.StatusServiceUnavailable)
+			httpx.WriteJSONError(w, http.StatusServiceUnavailable, "R2 未配置，请先完成配置")
 			return
 		}
 		filesHandler := handlers.NewFilesHandler(database.DB, r2Service)
 
 		if r.Method == http.MethodDelete {
-			// 删除需要认证
-			middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				filesHandler.Delete(w, r)
-			})).ServeHTTP(w, r)
-		} else {
-			// 下载不需要认证
-			filesHandler.GetDownloadURL(w, r)
+			middleware.AuthMiddleware()(http.HandlerFunc(filesHandler.Delete)).ServeHTTP(w, r)
+			return
 		}
+		filesHandler.GetDownloadURL(w, r)
 	})
 
 	// 存储统计路由
 	mux.Handle("/api/stats", middleware.AuthMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] GET /api/stats")
 		statsHandler := handlers.NewStatsHandler(database.DB, cfg.TotalStorage)
 		statsHandler.GetStats(w, r)
 	})))
@@ -307,16 +303,13 @@ func main() {
 	if _, err := os.Stat(staticDir); err == nil {
 		fs := http.FileServer(http.Dir(staticDir))
 		mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 如果请求的是 API 路径，返回 404
 			if len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
 				http.NotFound(w, r)
 				return
 			}
 
-			// 检查文件是否存在
 			path := filepath.Join(staticDir, r.URL.Path)
 			if _, err := os.Stat(path); os.IsNotExist(err) {
-				// 如果文件不存在，返回 index.html（用于 SPA 路由）
 				http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
 				return
 			}
@@ -344,24 +337,41 @@ func main() {
 		})
 	}
 
-	// 应用速率限制中间件
 	handler := middleware.RateLimitMiddleware(database.DB)(mux)
 
-	// 启动服务器
-	addr := ":" + cfg.Port
-	// 启动过期文件清理任务
-	app.StartCleanupTask()
+	// 收到 SIGINT/SIGTERM 后停止后台任务并优雅关闭
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	app.StartCleanupTask(ctx)
 	log.Println("[App] 过期文件清理任务已启动")
 
-	passwordSet := database.IsPasswordSet()
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("[App] 收到退出信号，正在关闭...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[App] 优雅关闭超时: %v", err)
+		}
+	}()
+
 	log.Printf("[App] ========================================")
 	log.Printf("[App] R2Box 服务器启动成功")
-	log.Printf("[App] 地址: http://localhost%s", addr)
-	log.Printf("[App] 密码状态: %v", passwordSet)
+	log.Printf("[App] 地址: http://localhost%s", srv.Addr)
+	log.Printf("[App] 密码状态: %v", database.IsPasswordSet())
 	log.Printf("[App] R2 配置状态: %v", r2Configured)
 	log.Printf("[App] ========================================")
 
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[App] 服务器启动失败: %v", err)
 	}
+
+	log.Println("[App] 已退出")
 }

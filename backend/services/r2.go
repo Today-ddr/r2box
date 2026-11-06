@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // R2Service R2 存储服务
@@ -23,7 +25,7 @@ type R2Service struct {
 
 // R2Config R2 配置
 type R2Config struct {
-	Endpoint        string `json:"endpoint"`          // 完整端点 URL，如 https://xxx.r2.cloudflarestorage.com
+	Endpoint        string `json:"endpoint"` // 完整端点 URL，如 https://xxx.r2.cloudflarestorage.com
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
 	BucketName      string `json:"bucket_name"`
@@ -247,11 +249,61 @@ func (s *R2Service) DeleteObject(key string) error {
 		Key:    aws.String(key),
 	})
 
-	if err != nil {
+	if err != nil && !IsNotFound(err) {
 		log.Printf("[R2] 删除对象失败: %v", err)
+		return err
 	}
 
-	return err
+	return nil
+}
+
+// ObjectInfo 对象存储中的实际元数据
+type ObjectInfo struct {
+	Size        int64
+	ContentType string
+}
+
+// HeadObject 读取对象的真实大小和类型
+func (s *R2Service) HeadObject(key string) (*ObjectInfo, error) {
+	out, err := s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	info := &ObjectInfo{}
+	if out.ContentLength != nil {
+		info.Size = *out.ContentLength
+	}
+	if out.ContentType != nil {
+		info.ContentType = *out.ContentType
+	}
+
+	return info, nil
+}
+
+// IsNotFound 判断错误是否为「对象不存在」
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound", "404":
+			return true
+		}
+	}
+
+	var respErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 404 {
+		return true
+	}
+
+	return false
 }
 
 // AbortMultipartUpload 终止分片上传
@@ -291,4 +343,3 @@ func (s *R2Service) TestConnection() error {
 	log.Println("[R2] 连接测试成功")
 	return nil
 }
-

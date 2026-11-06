@@ -62,6 +62,7 @@
             <div style="text-align: center;">
               <div style="font-weight: 600; margin-bottom: 4px;">存储空间</div>
               <div>{{ storageStats.usedSpaceFormatted }} / {{ storageStats.totalSpaceFormatted }}</div>
+              <div v-if="storageStats.inFlightSpace > 0" style="color: #f59e0b; font-size: 12px; margin-top: 2px;">上传中 {{ storageStats.inFlightFormatted }}</div>
               <div style="color: #999; font-size: 12px; margin-top: 2px;">已使用 {{ Math.round(storageStats.usagePercent) }}%</div>
             </div>
           </n-tooltip>

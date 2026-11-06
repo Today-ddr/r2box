@@ -198,7 +198,7 @@ func (h *SetupHandler) TestConnection(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(TestResponse{
 			Success: false,
-			Message: "创建 R2 客户端失败: " + err.Error(),
+			Message: "创建 R2 客户端失败，请检查配置",
 		})
 		return
 	}
@@ -209,7 +209,7 @@ func (h *SetupHandler) TestConnection(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(TestResponse{
 			Success: false,
-			Message: "连接测试失败: " + err.Error(),
+			Message: "连接测试失败，请检查 Endpoint、密钥和存储桶名称",
 		})
 		return
 	}

@@ -244,7 +244,8 @@ const getShortUrl = (file) => {
 }
 
 const getDownloadUrl = (file) => {
-  return file.download_url || (window.location.origin + `/api/files/${file.id}/download`)
+  // 统一走本站入口，由后端校验后跳转，R2 直链不再对外暴露
+  return window.location.origin + `/api/files/${file.id}/download`
 }
 
 const copyUrl = (url, type) => {

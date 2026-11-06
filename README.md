@@ -27,7 +27,8 @@ R2Box 是一个基于 Cloudflare R2 对象存储的轻量级临时文件分享�
 - **前端直传** - 文件直接上传到 R2，不占用服务器带宽
 - **大文件支持** - 支持最大 5GB 文件，自动分片上传
 - **自动过期** - 支持 1天/3天/7天/30天 自动删除
-- **R2 直链** - 上传完成后直接返回 R2 预签名下载链接
+- **分享链接** - 提供短链和下载直链，后端校验过期后跳转到 R2
+- **配额控制** - 按总容量限制上传，超额直接拒绝
 - **密码鉴权** - 首次访问设置密码，无需环境变量配置
 - **速率限制** - 防暴力破解，IP 限流保护
 - **存储监控** - 实时查看存储空间使用情况
@@ -59,10 +60,34 @@ R2Box 是一个基于 Cloudflare R2 对象存储的轻量级临时文件分享�
 
 ### 2. 一键部署
 
+服务器上已装好 Docker 与 Compose 插件，复制这一条执行即可：
+
 ```bash
-mkdir -p r2box/data && cd r2box
-curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml
-docker compose up -d
+mkdir -p r2box/data && cd r2box \
+  && curl -fsSLO https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml \
+  && chown -R 1000:1000 data \
+  && docker compose up -d
+```
+
+它依次做了四件事：建数据目录 → 下载 compose 配置 → 把目录交给容器内的 UID 1000 → 拉取镜像并启动。
+
+> 非 root 用户把 `chown` 换成 `sudo chown -R 1000:1000 data`。
+> 容器以非 root 身份运行，这一步不能省，否则启动时会报数据库打不开。
+
+确认启动成功：
+
+```bash
+docker compose ps                  # 状态应为 running (healthy)
+curl -s localhost:9988/healthz     # 期望返回 {"status":"ok"}
+```
+
+然后浏览器打开 `http://<服务器IP>:9988`。
+
+日常维护：
+
+```bash
+docker compose logs -f             # 看日志
+docker compose pull && docker compose up -d   # 升级到最新镜像
 ```
 
 ### 3. 配置 R2 CORS（必须）
@@ -104,27 +129,20 @@ docker compose up -d
 
 ### 生产环境部署 (Production)
 
-使用 GitHub Container Registry 预构建镜像，推荐用于生产环境。
+使用 GitHub Container Registry 预构建镜像，推荐用于生产环境。完整的首次部署步骤见 [一键部署](#2-一键部署)，这里只列日常操作。
 
 **配置文件：** `docker-compose.yml`
-
 **镜像源：** `ghcr.io/today-ddr/r2box:latest`
 
-```bash
-# 下载配置文件
-curl -O https://raw.githubusercontent.com/Today-ddr/r2box/master/docker-compose.yml
+| 操作 | 命令 |
+|---|---|
+| 启动 | `docker compose up -d` |
+| 查看状态 | `docker compose ps` |
+| 查看日志 | `docker compose logs -f` |
+| 升级镜像 | `docker compose pull && docker compose up -d` |
+| 停止 | `docker compose down` |
 
-# 启动服务
-docker compose up -d
-
-# 查看日志
-docker compose logs -f
-
-# 更新到最新版本
-docker compose pull && docker compose up -d
-```
-
-或使用 Docker 命令直接运行：
+不想用 compose 时可以直接 `docker run`（同样要先 `chown -R 1000:1000 data`）：
 
 ```bash
 docker run -d \
@@ -134,6 +152,13 @@ docker run -d \
   -v ./data:/app/data \
   ghcr.io/today-ddr/r2box:latest
 ```
+
+**配额与下载行为：**
+
+- `TOTAL_STORAGE` 是真实配额，包含正在上传中的文件；超额时新的上传会被拒绝（HTTP 507）
+- 上传完成后服务端会用 `HeadObject` 复核真实大小，与声明不符且超限的对象会被删除
+- 下载统一经过 `/api/files/{id}/download`，后端校验过期后 302 到 R2 临时签名链接，所以复制出的链接长期有效
+- 健康检查端点为 `/healthz`
 
 ### 本地开发部署 (Development)
 
@@ -213,6 +238,7 @@ rm ./data/r2box.db
 r2box/
 ├── backend/                 # Go 后端
 ├── frontend/                # Vue.js 前端
+├── docs/                    # 设计文档
 ├── img/                     # 截图
 ├── Dockerfile               # 多阶段构建
 ├── docker-compose.yml       # 生产环境配置
@@ -328,6 +354,25 @@ r2box/
 - 检查防火墙是否开放 9988 端口
 - 运行 `docker compose logs` 查看错误日志
 - 确认 Docker 容器正常运行：`docker ps`
+
+</details>
+
+<details>
+<summary><b>Q: 容器起不来，日志报数据库打不开 / permission denied？</b></summary>
+
+数据目录权限不对。容器以 UID 1000 运行，宿主目录要交给同一个用户：
+
+```bash
+sudo chown -R 1000:1000 ./data
+docker compose restart
+```
+
+</details>
+
+<details>
+<summary><b>Q: 上传提示存储空间不足（HTTP 507）？</b></summary>
+
+`TOTAL_STORAGE` 是真实配额，包含正在上传中的文件。清理旧文件，或调大 compose 里的 `TOTAL_STORAGE` 后 `docker compose up -d` 重启。
 
 </details>
 

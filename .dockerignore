@@ -1,0 +1,14 @@
+.git
+.github
+docs
+img
+**/node_modules
+frontend/dist
+backend/data
+data
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+.ace-tool
